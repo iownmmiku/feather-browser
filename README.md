@@ -179,9 +179,83 @@ WebView2 直接销毁，并调用 `MemoryMonitor.TrimWorkingSet()`
 **数据**
 - 书签（`Ctrl+D` / 地址栏右侧星标）
 - 历史记录（内存里只保留最近 800 条，因此长期使用内存也是常数级）
+- **登录密码**：本机加密保存 + 登录表单自动填充（见下一节）
 - 全部数据集中在 `%LOCALAPPDATA%\FeatherBrowser\`，卸载只需删这一个目录
 
-## 六、快捷键
+## 六、从夸克（或其他 Chromium 浏览器）迁移
+
+夸克是 Chromium 内核，数据就是标准的 Chromium 文件格式，所以可以直接读。
+在菜单里选 **「从夸克导入…」**，勾选要迁移的内容即可。
+
+命令行也可以（适合批量或排查问题）：
+
+```powershell
+# 全部导入，历史取最近 2000 条
+FeatherBrowser.exe --import-quark=all;2000 --import-report=报告.txt
+
+# 只导书签 / 只导历史 / 只导密码
+FeatherBrowser.exe --import-quark=bookmarks
+FeatherBrowser.exe --import-quark=history;500
+FeatherBrowser.exe --import-quark=passwords
+```
+
+三块数据的原理与限制：
+
+| 数据 | 来源文件 | 说明 |
+|---|---|---|
+| **书签** | `Bookmarks`（JSON） | 读 `roots` 树，按 URL 去重合并；原有的书签不会被覆盖。目录名会拼进标题，因为轻羽的书签是平铺的 |
+| **浏览历史** | `History`（SQLite） | 读 `urls` 表，按访问时间倒序取最近的 N 条。**内存里只保留 800 条**，导入更多的部分会被淘汰 |
+| **保存的密码** | `Login Data` + `Local State` | 先用 DPAPI 解开 `Local State` 里的主密钥，再用 AES-256-GCM 逐条解密。明文只在内存里存在一瞬，立刻用你的 Windows 账户重新加密写进轻羽的密码库，**不生成任何明文文件** |
+
+几个实现上必须注意的点（都踩过）：
+
+- **读之前先复制快照**：夸克运行时这些文件是打开的，直接读可能拿到写了一半的内容。
+- **不要以只读模式打开 SQLite**：带 `-wal` 日志的库在只读模式下会直接打不开，
+  要用可读写模式打开**副本**（原始文件仍然只读）。
+- **解主密钥时不能带附加熵**：Chromium 用的是无熵 DPAPI，传自己的熵会得到错误码 13。
+  而轻羽自己的密码库用的是**带熵**的 DPAPI，两者不能混。
+- **批量导入要先进批量模式**：否则每加一条书签就异步写一次盘，
+  几十条会互相抢文件锁，最后一条都写不进去。
+
+**导入不了的情况**：如果夸克的数据来自另一个 Windows 账户或另一台电脑，
+主密钥解不开，密码会导入失败（书签和历史不受影响）。
+
+> Cookie / 登录状态**不做迁移**。新版 Chromium 对 Cookie 使用应用绑定加密，
+> 夸克的 Cookie 本来就搬不过来；而且复制会话 Cookie 等同于会话劫持，即使技术上可行也不应该做。
+
+## 七、密码与自动填充
+
+### 密码怎么存的
+
+- 每条密码单独用 **Windows DPAPI**（当前用户 + 本程序专用附加熵）加密，只存密文；
+- 站点与用户名保持明文 —— 自动填充需要按站点匹配，主流浏览器也是这么存的；
+- 换 Windows 账户或换电脑都解不开，**没有云端同步**；
+- 密码库文件：`%LOCALAPPDATA%\FeatherBrowser\passwords.json`
+
+### 自动填充怎么工作
+
+| 时机 | 行为 |
+|---|---|
+| 页面加载完成 | 若该站点有已保存账号，注入一段辅助脚本 |
+| 点击用户名 / 密码框 | 弹出「轻羽已保存的账号」列表，**只显示用户名** |
+| 点选某个账号 | 宿主动作：单独注入一次脚本，把密码填进去 |
+| 提交登录表单 | 若还没保存过这个账号，询问是否保存 |
+
+**安全上的关键取舍**：注入页面的脚本里**只有用户名，没有密码**。
+密码要等你点选之后，由宿主单独执行一次脚本填入。
+所以即使页面里有恶意脚本，它也拿不到你保存的密码 —— 除非你自己点它。
+
+这条设计有个直接后果：**不会「打开页面就自动填好」**。
+对个人电脑方便性略差，但避免了页面一加载就把密码交给 DOM。
+自动填充的开关在菜单和设置里都有。
+
+> 当前密码库只在本地保存，没有主密码（master password）保护。
+> 也就是说，能登录你这个 Windows 账户的人，就能用轻羽看到已保存的密码。
+> 这一点和 Edge / Chrome 默认的「不设主密码」行为一致，但你应该知道这个前提。
+
+
+
+## 八、快捷键
 
 | 快捷键 | 功能 | 快捷键 | 功能 |
 |---|---|---|---|
@@ -194,7 +268,7 @@ WebView2 直接销毁，并调用 `MemoryMonitor.TrimWorkingSet()`
 | `Ctrl+J` | 切换主题 | `Ctrl+=` / `Ctrl+0` | 界面放大 / 复位 |
 | `F11` | 全屏 | `Esc` | 停止加载 / 关闭查找条 |
 
-## 七、实测数据
+## 九、实测数据
 
 自检报告见 [`docs/selftest-report.txt`](docs/selftest-report.txt)。
 它连续打开 5 个真实网站（example.com / Bing / 百度 / cn.bing / 搜狗），
@@ -219,7 +293,7 @@ WebView2 直接销毁，并调用 `MemoryMonitor.TrimWorkingSet()`
 - 工作集统计包含多个进程共享的页面，所以增量会小于各进程工作集之和；
 - 系统可用内存会受其它程序影响而上下浮动，只能作参考。
 
-## 八、目录结构
+## 十、目录结构
 
 ```
 feather-browser/
@@ -233,9 +307,13 @@ feather-browser/
 │  │  ├─ TabManager.cs           ★ 内存策略调度中心（填桶算法）
 │  │  ├─ AdBlocker.cs            域名 + 路径关键字拦截
 │  │  ├─ MemoryMonitor.cs        进程内存统计与工作集回收
-│  │  ├─ HistoryStore.cs         历史（内存上限 800 条）
-│  │  ├─ BookmarkStore.cs        书签
-│  │  └─ UrlUtils.cs             地址识别、内置首页 HTML（浅色/深色两套）
+│  │  ├─ HistoryStore.cs         历史（内存上限 800 条，支持批量导入）
+│  │  ├─ BookmarkStore.cs        书签（写出串行化，支持批量导入）
+│  │  ├─ PasswordStore.cs        密码库（逐条 DPAPI 加密）
+│  │  ├─ Dpapi.cs                Windows 数据保护 API 封装（支持指定熵）
+│  │  ├─ QuarkImporter.cs        ★ 从夸克迁移书签 / 历史 / 密码
+│  │  ├─ LoginAutofill.cs        登录表单辅助脚本的装载与拼装
+│  │  └─ UrlUtils.cs             地址识别、eTLD+1、内置首页 HTML
 │  ├─ Services/
 │  │  ├─ AppSettings.cs          设置与会话（含主题模式、界面倍率）
 │  │  ├─ AppPaths.cs             数据目录与日志
@@ -251,7 +329,12 @@ feather-browser/
 │     ├─ StatusBar.cs            自绘状态栏
 │     ├─ MemoryDialog.cs         内存与性能面板
 │     ├─ SettingsDialog.cs       设置
+│     ├─ ImportDialog.cs         从夸克导入的向导
+│     ├─ PasswordsDialog.cs      密码管理（默认不显示密码）
 │     └─ AppIcon.cs              代码生成的程序图标
+├─ src/Assets/
+│  ├─ blocklist.txt              内置拦截规则
+│  └─ login-autofill.js          注入页面的自动填充脚本（不含密码）
 ├─ tools/
 │  ├─ build-installer.ps1        自包含发布 + NSIS 打包
 │  ├─ installer.nsi              NSIS 安装脚本
@@ -262,7 +345,7 @@ feather-browser/
 └─ README.md
 ```
 
-## 九、开发提示
+## 十一、开发提示
 
 几个调试开关（普通用户用不到）：
 
@@ -279,7 +362,7 @@ $env:FEATHER_UITEST_DELAY='2000'   # 控制弹层延时（毫秒）
 FeatherBrowser.exe --selftest report.txt
 ```
 
-## 十、已知限制
+## 十二、已知限制
 
 - 页内查找是注入脚本实现的高亮跳转，没有「第 3/17 项」这样的计数。
 - 「加载图片」关闭后需要刷新页面才生效。
@@ -288,8 +371,11 @@ FeatherBrowser.exe --selftest report.txt
 - 无痕窗口使用独立临时目录实现，不读取系统 Edge 的登录状态。
 - 没有扩展、没有同步、没有书签导入导出。
 - 深色模式下网页能否变暗取决于内核的自动深色渲染，部分网站不会生效。
+- **密码自动填充的站点兼容性未做大规模验证**：脚本靠「密码框 + 前一个文本输入框」
+  这种通用结构识别登录表单，绝大多数站点适用，但用自定义组件的站点可能识别不到。
+- **Cookie 不迁移**：从夸克只搬书签、历史和密码，登录状态需要重新登录。
 
-## 十一、和 Via 的关系
+## 十三、和 Via 的关系
 
 界面形态与交互习惯参考了 Via 的极简思路：单窗口、顶部一条细工具栏、底部一条功能条、
 标签以列表卡片方式管理、菜单里集中收纳开关。代码是独立实现的，
@@ -298,7 +384,7 @@ FeatherBrowser.exe --selftest report.txt
 省内存的思路也是同源的：**不追求「同时把所有标签都渲染好」，而是承认后台标签不需要活着**，
 把「活着」的标签数量压到最低，用一点点切换时的加载时间换回内存。
 
-## 十二、许可
+## 十四、许可
 
 本项目代码采用 [MIT 许可](LICENSE)。
 

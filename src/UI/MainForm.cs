@@ -29,6 +29,7 @@ internal sealed class MainForm : Form
     private readonly AdBlocker _adBlock = new();
     private readonly HistoryStore _history = new();
     private readonly BookmarkStore _bookmarks = new();
+    private readonly PasswordStore _passwords = new();
     private readonly bool _incognito;
     private readonly string _temporaryDataFolder;
     private readonly string _initialUrl;
@@ -451,7 +452,7 @@ internal sealed class MainForm : Form
 
     private async Task StartAsync()
     {
-        _tabs = new TabManager(_settings, _adBlock, _history, _bookmarks,
+        _tabs = new TabManager(_settings, _adBlock, _history, _bookmarks, _passwords,
             _viewHost, _parking, this, _incognito, _temporaryDataFolder);
         _tabs.TabsChanged += () => UpdateChrome();
         _tabs.NewWindowRequested += url =>
@@ -459,6 +460,14 @@ internal sealed class MainForm : Form
             if (IsHandleCreated)
             {
                 BeginInvoke(() => _tabs.NewTab(url));
+            }
+        };
+        // 登录表单提交后询问是否保存
+        _tabs.SaveCredentialRequested += (tab, username, password) =>
+        {
+            if (IsHandleCreated)
+            {
+                BeginInvoke(() => PromptSaveCredential(tab, username, password));
             }
         };
 
@@ -911,6 +920,17 @@ internal sealed class MainForm : Form
             },
             new()
             {
+                Text = "从夸克导入…",
+                Action = ShowQuarkImport, StartsGroup = true,
+            },
+            new()
+            {
+                Text = "管理保存的密码",
+                Value = _passwords.Count > 0 ? $"{_passwords.Count} 条" : "空",
+                Action = ShowPasswordManager,
+            },
+            new()
+            {
                 Text = "内存与性能…",
                 Action = ShowMemoryDialog,
             },
@@ -1093,6 +1113,93 @@ internal sealed class MainForm : Form
         MemoryMonitor.Refresh();
         UpdateMemoryReadout();
         SetStatus($"已回收后台标签内存（当前 {MemoryMonitor.Mb(MemoryMonitor.WebViewWorkingSet)}）");
+    }
+
+    // ================================================================ 密码与导入
+
+    /// <summary>登录表单提交后询问是否保存这条凭据。</summary>
+    private void PromptSaveCredential(BrowserTab tab, string username, string password)
+    {
+        if (tab == null)
+        {
+            return;
+        }
+
+        string origin = UrlUtils.OriginOf(tab.Url);
+        string site = UrlUtils.HostOf(tab.Url);
+        string shownUser = string.IsNullOrEmpty(username) ? "（无用户名）" : username;
+
+        DialogResult answer = MessageBox.Show(this,
+            $"是否让轻羽保存这个网站的登录信息？\r\n\r\n" +
+            $"网站：{site}\r\n" +
+            $"账号：{shownUser}\r\n\r\n" +
+            "密码会用当前 Windows 账户加密后保存在本机，不会明文落盘。",
+            "保存密码", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+
+        if (answer != DialogResult.Yes)
+        {
+            return;
+        }
+
+        _passwords.Save(string.IsNullOrEmpty(origin) ? tab.Url : origin, username, password,
+            source: "");
+        SetStatus($"已保存 {site} 的登录信息");
+    }
+
+    /// <summary>从夸克导入书签 / 历史 / 密码。</summary>
+    private void ShowQuarkImport()
+    {
+        if (!QuarkImporter.IsAvailable())
+        {
+            MessageBox.Show(this,
+                "没有找到夸克的数据目录：\r\n" + QuarkImporter.QuarkUserDataPath +
+                "\r\n\r\n请确认本机安装过夸克浏览器并至少使用过一次。",
+                "从夸克导入", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        using var dialog = new ImportDialog();
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        UseWaitCursor = true;
+        ImportResult result;
+        try
+        {
+            var importer = new QuarkImporter(_bookmarks, _history, _passwords);
+            result = importer.Import(dialog.ImportBookmarks, dialog.ImportHistory,
+                dialog.ImportPasswords, dialog.HistoryLimit);
+        }
+        finally
+        {
+            UseWaitCursor = false;
+        }
+
+        var text = new System.Text.StringBuilder();
+        text.AppendLine(result.Summary());
+        foreach (string note in result.Notes)
+        {
+            text.AppendLine();
+            text.AppendLine("· " + note);
+        }
+
+        MessageBox.Show(this, text.ToString().TrimEnd(),
+            result.AnySuccess ? "导入完成" : "导入结束",
+            MessageBoxButtons.OK,
+            result.AnySuccess ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+
+        SetStatus("导入完成：" + result.Summary());
+        UpdateChrome();
+    }
+
+    /// <summary>管理保存的密码。</summary>
+    private void ShowPasswordManager()
+    {
+        using var dialog = new PasswordsDialog(_passwords);
+        dialog.ShowDialog(this);
+        SetStatus($"密码库现有 {_passwords.Count} 条记录");
     }
 
     private void ClearCache()

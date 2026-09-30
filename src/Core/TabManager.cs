@@ -46,6 +46,12 @@ public sealed class TabManager
 
     public BookmarkStore Bookmarks { get; }
 
+    /// <summary>密码库。自动填充与「保存密码」提示都走它。</summary>
+    public PasswordStore Passwords { get; }
+
+    /// <summary>需要询问用户是否保存登录凭据时触发（账号, 密码）。</summary>
+    public event Action<BrowserTab, string, string> SaveCredentialRequested;
+
     public bool IsIncognito { get; }
 
     /// <summary>无痕会话的临时数据目录，退出时删除。</summary>
@@ -88,13 +94,14 @@ public sealed class TabManager
     }
 
     public TabManager(AppSettings settings, AdBlocker adBlocker, HistoryStore history,
-        BookmarkStore bookmarks, Panel viewHost, Panel parking, Control uiInvoker,
-        bool incognito, string temporaryDataFolder)
+        BookmarkStore bookmarks, PasswordStore passwords, Panel viewHost, Panel parking,
+        Control uiInvoker, bool incognito, string temporaryDataFolder)
     {
         Settings = settings;
         AdBlock = adBlocker;
         History = history;
         Bookmarks = bookmarks;
+        Passwords = passwords;
         _viewHost = viewHost;
         _parking = parking;
         _uiInvoker = uiInvoker;
@@ -506,7 +513,9 @@ public sealed class TabManager
             var s = core.Settings;
             s.IsScriptEnabled = Settings.JavaScriptEnabled;
             s.AreDefaultScriptDialogsEnabled = true;
-            s.IsWebMessageEnabled = false;
+            // 自动填充要用 WebMessage 和页面通信（页面把用户点选的账号、
+            // 以及提交时的输入值发回来），所以必须打开
+            s.IsWebMessageEnabled = true;
             s.AreDefaultContextMenusEnabled = true;
             s.AreDevToolsEnabled = false;
             s.IsStatusBarEnabled = false;
@@ -581,6 +590,153 @@ public sealed class TabManager
             return;
         }
         NewWindowRequested?.Invoke(uri);
+    }
+
+    // ---------------------------------------------------------------- 自动填充
+
+    /// <summary>
+    /// 把登录辅助脚本注入某个标签的页面。
+    ///
+    /// <p>注入的内容**只含用户名**：密码要等用户在页面上的下拉里点选之后，
+    /// 由 <see cref="NotifyCredentialPicked"/> 单独注入那一条。
+    /// </summary>
+    internal void InjectLoginHelper(BrowserTab tab)
+    {
+        if (tab == null || IsIncognito || tab.View?.CoreWebView2 == null)
+        {
+            return;
+        }
+        if (!Settings.PasswordAutofill)
+        {
+            return;
+        }
+
+        try
+        {
+            var matches = Passwords.FindForUrl(tab.Url);
+            var accounts = matches
+                .Select(e => (Id: e.Username + "\u0001" + e.Domain, Username: e.Username))
+                .ToList();
+
+            // 站点上没有已保存账号时 BuildScript 会返回空串，等价于不注入
+            string script = LoginAutofill.BuildScript(accounts);
+            if (script.Length == 0)
+            {
+                return;
+            }
+            _ = tab.View.CoreWebView2.ExecuteScriptAsync(script);
+        }
+        catch (Exception ex)
+        {
+            Log.Warn("注入登录辅助脚本失败: " + ex.Message);
+        }
+    }
+
+    /// <summary>用户在页面的账号下拉里选了某一项。</summary>
+    internal void NotifyCredentialPicked(BrowserTab tab, string accountId)
+    {
+        if (tab?.View?.CoreWebView2 == null)
+        {
+            return;
+        }
+
+        try
+        {
+            var matches = Passwords.FindForUrl(tab.Url);
+            PasswordEntry target = null;
+
+            if (!string.IsNullOrEmpty(accountId))
+            {
+                // id 由「用户名 \u0001 域名」拼成，用第一个命中项即可
+                string[] parts = accountId.Split('\u0001');
+                string wantUser = parts.Length > 0 ? parts[0] : "";
+                target = matches.FirstOrDefault(e =>
+                    string.Equals(e.Username, wantUser, StringComparison.Ordinal));
+            }
+            target ??= matches.FirstOrDefault();
+
+            if (target == null)
+            {
+                return;
+            }
+
+            string password = Passwords.RevealPassword(target);
+            if (string.IsNullOrEmpty(password))
+            {
+                Log.Warn("这条凭据的密码无法解开（可能来自另一个 Windows 账户）");
+                return;
+            }
+
+            // 明文只在这一瞬间存在于这条脚本字符串里，不写日志、不缓存
+            string script =
+                "window.__featherFillPassword&&window.__featherFillPassword(" +
+                JsQuote(target.Username) + "," + JsQuote(password) + ")";
+            _ = tab.View.CoreWebView2.ExecuteScriptAsync(script);
+        }
+        catch (Exception ex)
+        {
+            Log.Warn("填充密码失败: " + ex.Message);
+        }
+    }
+
+    /// <summary>用户在登录表单里提交了，问一下要不要保存。</summary>
+    internal void NotifyCredentialSubmitted(BrowserTab tab, string username, string password)
+    {
+        if (tab == null || string.IsNullOrEmpty(password))
+        {
+            return;
+        }
+        if (!Settings.PasswordAutofill || IsIncognito)
+        {
+            return;
+        }
+
+        // 已经有同站点同账号的记录了就不打扰
+        var existing = Passwords.FindForUrl(tab.Url);
+        if (existing.Any(e => string.Equals(e.Username, username ?? "",
+                StringComparison.Ordinal)))
+        {
+            return;
+        }
+
+        SaveCredentialRequested?.Invoke(tab, username ?? "", password);
+    }
+
+    /// <summary>把字符串转成 JS 字面量（用于把用户名/密码拼进脚本）。</summary>
+    private static string JsQuote(string text)
+    {
+        if (text == null)
+        {
+            return "''";
+        }
+        var sb = new System.Text.StringBuilder(text.Length + 2);
+        sb.Append('"');
+        foreach (char c in text)
+        {
+            switch (c)
+            {
+                case '"': sb.Append("\\\""); break;
+                case '\\': sb.Append("\\\\"); break;
+                case '\n': sb.Append("\\n"); break;
+                case '\r': sb.Append("\\r"); break;
+                case '\t': sb.Append("\\t"); break;
+                case '<': sb.Append("\\u003c"); break;
+                case '>': sb.Append("\\u003e"); break;
+                case '&': sb.Append("\\u0026"); break;
+                default:
+                    if (c < 0x20)
+                    {
+                        sb.Append("\\u").Append(((int)c).ToString("x4"));
+                    }
+                    else
+                    {
+                        sb.Append(c);
+                    }
+                    break;
+            }
+        }
+        sb.Append('"');
+        return sb.ToString();
     }
 
     internal void NotifyWindowCloseRequested(BrowserTab tab) => CloseTab(tab);

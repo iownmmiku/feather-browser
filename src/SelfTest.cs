@@ -62,7 +62,7 @@ internal static class SelfTest
         {
             try
             {
-                tabs = new TabManager(settings, adBlock, history, bookmarks,
+                tabs = new TabManager(settings, adBlock, history, bookmarks, new PasswordStore(),
                     viewHost, parking, form, incognito: false, temporaryDataFolder: null);
 
                 report.AppendLine("==== 轻羽浏览器 内存自检 ====");

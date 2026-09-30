@@ -9,6 +9,15 @@ internal static class Program
     [STAThread]
     private static void Main(string[] args)
     {
+        // 数据目录覆盖必须在任何 AppPaths.Root 访问之前生效
+        foreach (string arg in args)
+        {
+            if (arg.StartsWith("--data-dir=", StringComparison.OrdinalIgnoreCase))
+            {
+                AppPaths.OverrideRoot(arg["--data-dir=".Length..].Trim('"'));
+            }
+        }
+
         AppPaths.EnsureCreated();
 
         // 自检模式：不需要人看界面，跑完把内存数据写进文件，便于脚本化验证。
@@ -18,6 +27,29 @@ internal static class Program
                 ? args[1]
                 : Path.Combine(AppPaths.Root, "selftest.txt");
             SelfTest.RunAsync(output).GetAwaiter().GetResult();
+            return;
+        }
+
+        // 从夸克导入数据（也可在界面里「设置 → 从夸克导入」触发）
+        //   --import-quark=all|bookmarks|history|passwords[;historyLimit]
+        string importSpec = null;
+        string importReport = null;
+        foreach (string arg in args)
+        {
+            if (arg.StartsWith("--import-quark=", StringComparison.OrdinalIgnoreCase))
+            {
+                importSpec = arg["--import-quark=".Length..];
+            }
+            else if (arg.StartsWith("--import-report=", StringComparison.OrdinalIgnoreCase))
+            {
+                importReport = arg["--import-report=".Length..].Trim('"');
+            }
+        }
+        if (importSpec != null)
+        {
+            // 注意：不要设置 Console.OutputEncoding —— 这是个 WinExe，
+            // 在没有真实控制台句柄时会抛 IOException 直接崩掉。
+            QuarkImportCli.Run(importSpec, importReport);
             return;
         }
 
@@ -51,6 +83,7 @@ internal static class Program
                 continue;
             }
 
+            // 启动时直接打开某个地址（普通用法）
             string candidate = UrlUtils.ExtractFirstUrl(arg);
             if (string.IsNullOrEmpty(candidate) && !arg.StartsWith('-'))
             {

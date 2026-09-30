@@ -557,6 +557,37 @@ public sealed class BrowserTab : IDisposable
 
         core.WindowCloseRequested += (_, _) => _manager.NotifyWindowCloseRequested(this);
 
+        // 登录表单自动填充：页面发回的消息在这里处理
+        core.WebMessageReceived += (_, e) =>
+        {
+            try
+            {
+                var parsed = LoginAutofill.ParseMessage(e.TryGetWebMessageAsString());
+                if (parsed == null)
+                {
+                    return;
+                }
+                switch (parsed.Value.Type)
+                {
+                    case "pick":
+                        _manager.NotifyCredentialPicked(this, parsed.Value.Id);
+                        break;
+                    case "submit":
+                        _manager.NotifyCredentialSubmitted(this, parsed.Value.Username,
+                            parsed.Value.Password);
+                        break;
+                }
+            }
+            catch
+            {
+                // 页面消息格式不对就忽略，不影响浏览
+            }
+        };
+
+        // 每次页面加载完成都注入一次：SPA 的登录框常常是后渲染出来的，
+        // 脚本自身幂等（window.__featherLogin 标记），重复注入没有副作用。
+        core.DOMContentLoaded += (_, _) => _manager.InjectLoginHelper(this);
+
         // 拦截钩子：满足条件时返回空响应
         core.WebResourceRequested += (_, e) =>
         {

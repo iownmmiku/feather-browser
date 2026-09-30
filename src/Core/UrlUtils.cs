@@ -218,6 +218,85 @@ public static class UrlUtils
                host.EndsWith("." + rule, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// 需要按「三段」处理的国家级后缀，例如 example.com.cn 的可注册域名是 com.cn 之前那段。
+    /// 不做完整的公共后缀表（那要几百 KB 数据），只覆盖常见的一部分：
+    /// 判断错了最多是自动填充范围偏宽或偏窄，不会造成安全问题。
+    /// </summary>
+    private static readonly HashSet<string> TwoPartSuffixes = new(StringComparer.Ordinal)
+    {
+        "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn", "ac.cn",
+        "com.hk", "org.hk", "edu.hk", "gov.hk", "com.tw", "org.tw",
+        "co.uk", "org.uk", "ac.uk", "gov.uk", "me.uk", "net.uk",
+        "co.jp", "or.jp", "ne.jp", "ac.jp", "go.jp",
+        "com.au", "net.au", "org.au", "edu.au", "gov.au",
+        "co.kr", "or.kr", "com.sg", "com.br", "com.mx", "com.tr",
+    };
+
+    /// <summary>
+    /// 求可注册域名（eTLD+1），用于按站点匹配保存的凭据。
+    /// 失败时返回原主机名。
+    /// </summary>
+    public static string RegistrableDomain(string url)
+    {
+        string host = RawHostOf(url);
+        if (string.IsNullOrEmpty(host))
+        {
+            return "";
+        }
+
+        // IP 地址没有「域名」概念，原样返回
+        if (host.IndexOf('.') < 0 || host.Count(c => c == '.') == 3 && IsIpv4(host))
+        {
+            return host;
+        }
+
+        string[] parts = host.Split('.');
+        if (parts.Length <= 2)
+        {
+            return host;
+        }
+
+        string lastTwo = parts[^2] + "." + parts[^1];
+        int take = TwoPartSuffixes.Contains(lastTwo) ? 3 : 2;
+        if (parts.Length <= take)
+        {
+            return host;
+        }
+        return string.Join('.', parts[^take..]);
+    }
+
+    /// <summary>主机的父域；example.com 的父域是 com（没有意义，返回空）。</summary>
+    public static string ParentDomain(string host)
+    {
+        if (string.IsNullOrEmpty(host))
+        {
+            return "";
+        }
+        int dot = host.IndexOf('.');
+        if (dot <= 0 || dot >= host.Length - 1)
+        {
+            return "";
+        }
+        string parent = host[(dot + 1)..];
+        // 只剩后缀（如 com / com.cn）时不算有效父域
+        return parent.Contains('.') || parent.Length > 3 ? parent : "";
+    }
+
+    /// <summary>取 origin（scheme://host:port），用于按站点精确匹配。</summary>
+    public static string OriginOf(string url)
+    {
+        try
+        {
+            var uri = new Uri(url, UriKind.Absolute);
+            return uri.GetLeftPart(UriPartial.Authority);
+        }
+        catch
+        {
+            return "";
+        }
+    }
+
     /// <summary>截断过长的显示文本，避免列表控件反复测量超长字符串。</summary>
     public static string Ellipsis(string text, int max)
     {

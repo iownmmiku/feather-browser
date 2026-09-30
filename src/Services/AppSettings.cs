@@ -45,6 +45,12 @@ public sealed class AppSettings
 
     public bool BlockThirdPartyCookies { get; set; } = true;
 
+    /// <summary>
+    /// 登录表单自动填充。开启后：站点有已保存账号时，点用户名输入框会弹出账号列表，
+    /// 选中后填充；提交登录时若还没保存过，会询问是否保存。
+    /// </summary>
+    public bool PasswordAutofill { get; set; } = true;
+
     // ---------------- 界面 ----------------
 
     /// <summary>

@@ -23,6 +23,7 @@ internal sealed class SettingsDialog : Form
     private readonly CheckBox _script = new();
     private readonly CheckBox _desktopUa = new();
     private readonly CheckBox _suspendOnDeactivate = new();
+    private readonly CheckBox _autofill = new();
     private readonly ThemedNumericUpDown _maxLiveTabs = new();
 
     private static readonly float[] ScaleSteps = { 1.0f, 1.15f, 1.3f, 1.5f };
@@ -159,6 +160,8 @@ internal sealed class SettingsDialog : Form
             "对国内视频网站通常无效");
         AddCheck(grid, row++, "窗口失焦时挂起后台标签", _suspendOnDeactivate,
             "切到别的程序时立刻释放后台标签的内存，切回来自动恢复");
+        AddCheck(grid, row++, "登录表单自动填充", _autofill,
+            "站点有已保存账号时，点用户名输入框会弹出账号列表；提交登录时询问是否保存密码");
 
         _maxLiveTabs.Minimum = 1;
         _maxLiveTabs.Maximum = 8;
@@ -306,6 +309,7 @@ internal sealed class SettingsDialog : Form
         _script.Checked = _settings.JavaScriptEnabled;
         _desktopUa.Checked = _settings.DesktopUserAgent;
         _suspendOnDeactivate.Checked = _settings.SuspendOnDeactivate;
+        _autofill.Checked = _settings.PasswordAutofill;
         _maxLiveTabs.Value = Math.Clamp(_settings.MaxLiveTabs, 1, 8);
     }
 
@@ -320,6 +324,7 @@ internal sealed class SettingsDialog : Form
         _settings.JavaScriptEnabled = _script.Checked;
         _settings.DesktopUserAgent = _desktopUa.Checked;
         _settings.SuspendOnDeactivate = _suspendOnDeactivate.Checked;
+        _settings.PasswordAutofill = _autofill.Checked;
         _settings.MaxLiveTabs = (int)_maxLiveTabs.Value;
         _settings.Save();
 

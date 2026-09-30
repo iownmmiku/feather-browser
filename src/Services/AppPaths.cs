@@ -8,7 +8,21 @@ namespace FeatherBrowser.Services;
 /// </summary>
 public static class AppPaths
 {
-    public static string Root { get; } = Path.Combine(
+    private static string _rootOverride;
+
+    /// <summary>
+    /// 覆盖数据根目录。必须在第一次访问 <see cref="Root"/> 之前调用。
+    /// 用途：让命令行导入 / 自检可以写到一个隔离目录，不动用户的真实数据。
+    /// </summary>
+    public static void OverrideRoot(string path)
+    {
+        if (!string.IsNullOrWhiteSpace(path))
+        {
+            _rootOverride = Path.GetFullPath(path);
+        }
+    }
+
+    public static string Root => _rootOverride ?? Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "FeatherBrowser");
 
@@ -17,6 +31,9 @@ public static class AppPaths
     public static string BookmarksFile => Path.Combine(Root, "bookmarks.json");
 
     public static string HistoryFile => Path.Combine(Root, "history.json");
+
+    /// <summary>密码库。里面每条密码都是 DPAPI 保护的密文，不含明文。</summary>
+    public static string PasswordsFile => Path.Combine(Root, "passwords.json");
 
     public static string LogFile => Path.Combine(Root, "feather.log");
 

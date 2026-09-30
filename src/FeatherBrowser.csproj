@@ -31,11 +31,18 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.2903.40" />
+    <!-- 读夸克的 History / Login Data 需要读 SQLite。用它而不是自写解析器：
+         后者要处理 B 树、溢出页、WAL，出错了会静默读出错数据，不值得。 -->
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.10" />
+    <!-- Windows 数据保护 API（DPAPI），用于加密本机密码库 -->
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
   </ItemGroup>
 
   <ItemGroup>
     <!-- 广告拦截规则打进程序集，随程序启动一起载入，不额外读文件 -->
     <EmbeddedResource Include="Assets\blocklist.txt" />
+    <!-- 页面内的自动填充脚本。放独立 .js 是为了避开 C# 字符串转义 -->
+    <EmbeddedResource Include="Assets\login-autofill.js" />
   </ItemGroup>
 
   <!--
