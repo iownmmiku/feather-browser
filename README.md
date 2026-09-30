@@ -300,5 +300,9 @@ FeatherBrowser.exe --selftest report.txt
 
 ## 十二、许可
 
-[MIT](LICENSE)。使用的 Microsoft Edge WebView2 运行时由微软提供，
-遵循其自身许可条款，不随本项目分发。
+本项目代码采用 [MIT 许可](LICENSE)。
+
+**第三方组件说明**：本程序使用 Microsoft Edge WebView2 运行时来显示网页。
+该运行时由微软提供，遵循其自身的许可条款，**不随本项目分发**；
+安装程序只做检测，并在缺失时引导用户从微软官方地址下载安装。
+详见 <https://developer.microsoft.com/microsoft-edge/webview2/>。
