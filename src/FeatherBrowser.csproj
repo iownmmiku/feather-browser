@@ -1,0 +1,56 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>FeatherBrowser</RootNamespace>
+    <AssemblyName>FeatherBrowser</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- 中文字符串较多，显式指定 UTF-8 源文件编码，避免乱码 -->
+    <CodePage>65001</CodePage>
+    <!-- 高 DPI 由 app.manifest 声明为 PerMonitorV2；WFAC010 是要求改用代码 API 的提示，
+         两者只需其一，这里保留 manifest 方案 -->
+    <NoWarn>$(NoWarn);WFAC010</NoWarn>
+    <!-- 体积与启动优化 -->
+    <PublishSingleFile>false</PublishSingleFile>
+    <!--
+      注意：这里不要写 SelfContained=false。
+      它会和发布命令行的自包含开关冲突，产出的自包含包表面上生成成功，
+      但启动时在 WebView2 内核初始化处直接 0xC0000005 崩溃。
+      是否自包含交给发布命令行的开关决定。
+    -->
+    <DebugType>embedded</DebugType>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <!-- 抑制平台兼容性告警（WebView2 / WinForms 在 net8.0-windows 下正常） -->
+    <NoWarn>$(NoWarn);CA1416;WFO5001</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.2903.40" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 广告拦截规则打进程序集，随程序启动一起载入，不额外读文件 -->
+    <EmbeddedResource Include="Assets\blocklist.txt" />
+  </ItemGroup>
+
+  <!--
+    关于体积（记录一下踩过的两个坑，避免以后重复尝试）：
+
+    1) 不要做 IL 裁剪（PublishTrimmed）。WinForms 与 WebView2 都依赖 COM 封送存根
+       （System.StubHelpers.*），裁剪会把它们当未使用代码删掉，表现为程序能启动、
+       但 WebView2 内核初始化抛 TypeLoadException: InterfaceMarshaler 找不到。
+
+    2) 不要只从发布清单里剔除 WPF 程序集。PresentationFramework/PresentationCore
+       确实用不到（约 25 MB），但 FeatherBrowser.deps.json 仍会声明它们，
+       运行时按清单加载却找不到文件，直接 0xC0000005 崩溃。
+       要么连清单一起改，要么不动 —— 目前选择不动。
+
+    实际压小体积靠 NSIS 的固态 LZMA 压缩（见 tools/installer.nsi）。
+  -->
+
+</Project>
