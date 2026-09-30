@@ -56,7 +56,8 @@ internal sealed class MainForm : Form
     private ToolbarButton _btnTabs;
     private ToolbarButton _btnMenu;
 
-    private TabListPopup _tabPopup;
+    private TabsSidebar _sidebar;
+    private bool _sidebarShown;
     private System.Windows.Forms.Timer _memoryTimer;
     private System.Windows.Forms.Timer _progressTimer;
     private int _progressValue;
@@ -182,16 +183,91 @@ internal sealed class MainForm : Form
 
         BuildToolbarChildren();
 
-        // 注意控件添加顺序：Dock=Top 的控件按添加顺序从外到内堆叠。
+        // 标签侧边栏：画在主窗口内的常规控件，Dock=Right，默认收成 0 宽隐藏
+        _sidebar = new TabsSidebar
+        {
+            ActivateTab = index => _tabs?.Activate(index),
+            CloseTab = index => CloseTabAt(index),
+            NewTab = () => _tabs?.NewTab(UrlUtils.InternalHome),
+            CloseAll = CloseAllTabs,
+            ShowMemoryDialog = ShowMemoryDialog,
+        };
+
+        // 注意控件添加顺序：Dock=Top/Right 的控件按添加顺序从外到内堆叠。
         Controls.Add(_viewHost);
         Controls.Add(_findBar);
         Controls.Add(_progressHost);
         Controls.Add(_toolbar);
         Controls.Add(_status);
         Controls.Add(_parking);
+        Controls.Add(_sidebar);
 
         _toolbar.Resize += (_, _) => LayoutToolbar();
         LayoutToolbar();
+    }
+
+    /// <summary>
+    /// 展开 / 收起标签侧边栏。
+    ///
+    /// <p>做法是「侧边栏与网页容器二选一显示」，而不是让两者并存。
+    /// 一开始想用「宽度归零 + Dock 自动让位」，但那样需要一次布局才能算出尺寸，
+    /// 展开瞬间会拿到 Height=0 而画不出来。直接切 Visible 最可靠、也没有过渡态问题。
+    /// </summary>
+    private void ToggleSidebar()
+    {
+        if (_tabs == null)
+        {
+            return;
+        }
+        _sidebarShown = !_sidebarShown;
+
+        if (_sidebarShown)
+        {
+            UpdateSidebar();
+            _sidebar.Width = _sidebar.ExpandedWidth;
+            _sidebar.Visible = true;
+            _sidebar.BringToFront();
+            _viewHost.Visible = false;
+        }
+        else
+        {
+            _sidebar.Visible = false;
+            _viewHost.Visible = true;
+            _viewHost.BringToFront();
+        }
+
+        _btnTabs.Active = _sidebarShown;
+        _btnTabs.Invalidate();
+    }
+
+    /// <summary>点「关闭全部」：留一个当前标签，其余关掉。</summary>
+    private void CloseAllTabs()
+    {
+        if (_tabs == null)
+        {
+            return;
+        }
+        int others = _tabs.Count - 1;
+        if (others <= 0)
+        {
+            SetStatus("只有一个标签，无需关闭");
+            return;
+        }
+
+        _tabs.CloseAllExcept(_tabs.Active);
+        SetStatus($"已关闭 {others} 个标签");
+        UpdateChrome();
+    }
+
+    /// <summary>把当前标签状态同步给侧边栏。</summary>
+    private void UpdateSidebar()
+    {
+        if (_sidebar == null || _tabs == null)
+        {
+            return;
+        }
+        _sidebar.Update(_tabs.Tabs, _tabs.ActiveIndex, _tabs.LiveCount, _tabs.ColdCount,
+            _settings.MaxLiveTabs, MemoryMonitor.Summary());
     }
 
     private void BuildToolbarChildren()
@@ -418,10 +494,12 @@ internal sealed class MainForm : Form
             }
         }
 
-        // 菜单与标签列表是独立窗体，下次弹出时按新尺寸重建
-        _tabPopup?.Close();
-        _tabPopup?.Dispose();
-        _tabPopup = null;
+        // 侧边栏尺寸跟着界面倍率走
+        if (_sidebar != null)
+        {
+            _sidebar.Width = _sidebarShown ? _sidebar.ExpandedWidth : 0;
+            _sidebar.Invalidate();
+        }
 
         Theme.ApplyTo(this);
         LayoutToolbar();
@@ -471,7 +549,6 @@ internal sealed class MainForm : Form
             }
         };
 
-        BuildTabPopup();
 
         _adBlock.Enabled = _settings.AdBlockEnabled;
 
@@ -582,17 +659,7 @@ internal sealed class MainForm : Form
         timer.Start();
     }
 
-    private void BuildTabPopup()
-    {
-        _tabPopup = new TabListPopup(
-            () => _tabs.Tabs,
-            () => _tabs.ActiveIndex,
-            index => _tabs.Activate(index),
-            index => CloseTabAt(index),
-            Theme.UiFont,
-            Theme.UiFontBold,
-            Theme.UiFontSmall);
-    }
+
 
     /// <summary>恢复上次的标签，或者打开初始地址 / 首页。</summary>
     private void RestoreTabs()
@@ -640,7 +707,7 @@ internal sealed class MainForm : Form
 
         _btnBack.Enabled = tab?.CanGoBack == true;
         _btnForward.Enabled = tab?.CanGoForward == true;
-        _btnTabs.Active = _tabPopup?.Visible == true;
+        _btnTabs.Active = _sidebarShown;
         _btnTabs.Badge = _tabs.Count > 1 ? _tabs.Count : 0;
 
         if (tab == null)
@@ -668,7 +735,7 @@ internal sealed class MainForm : Form
                + (_tabs.Count > 1 ? $"  [{_tabs.Count} 标签]" : "");
 
         _status.SetLeft(_statusText);
-        _tabPopup?.RefreshItems();
+        UpdateSidebar();
     }
 
     private void UpdateMemoryReadout()
@@ -685,6 +752,12 @@ internal sealed class MainForm : Form
             $" · 本程序 {MemoryMonitor.Mb(MemoryMonitor.WorkingSet)}" +
             $" · 拦截 {_adBlock.BlockedCount}";
         _status.SetRight(text);
+
+        // 侧边栏底部的内存读数也一起刷新
+        if (_sidebarShown)
+        {
+            UpdateSidebar();
+        }
     }
 
     private void SetStatus(string text)
@@ -827,20 +900,7 @@ internal sealed class MainForm : Form
 
     private void ShowTabList()
     {
-        if (_tabs == null)
-        {
-            return;
-        }
-        if (_tabPopup == null)
-        {
-            BuildTabPopup();
-        }
-        if (_tabPopup.Visible)
-        {
-            _tabPopup.Close();
-            return;
-        }
-        _tabPopup.ShowAt(_btnTabs);
+        ToggleSidebar();
     }
 
     private void ShowMenu()
@@ -986,10 +1046,8 @@ internal sealed class MainForm : Form
         WindowChrome.ApplyDarkTitleBar(this, Theme.Dark);
         ApplyPageTheme();
 
-        // 主题换了，标签列表与菜单的配色也要跟着换
-        _tabPopup?.Close();
-        _tabPopup?.Dispose();
-        _tabPopup = null;
+        // 主题换了，侧边栏配色也要跟着换
+        _sidebar?.Invalidate();
 
         SetStatus("主题：" + ThemeModeLabel());
     }
@@ -1595,7 +1653,6 @@ internal sealed class MainForm : Form
         {
             _memoryTimer?.Dispose();
             _progressTimer?.Dispose();
-            _tabPopup?.Dispose();
             _adBlock.Enabled = false;
         }
         base.Dispose(disposing);

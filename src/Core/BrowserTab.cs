@@ -81,15 +81,35 @@ public sealed class BrowserTab : IDisposable
 
     public void Touch() => LastUsedAt = DateTime.Now;
 
-    public string DisplayTitle =>
-        string.IsNullOrWhiteSpace(Title) || Title == "about:blank"
-            ? (UrlUtils.IsInternal(Url) ? "新标签页" : FallbackTitle())
-            : Title;
+    /// <summary>标题的初始占位值。用它判断「这个标签还从没拿到过真实标题」。</summary>
+    private const string DefaultTitle = "新标签页";
 
-    private string FallbackTitle()
+    public string DisplayTitle
     {
-        string host = UrlUtils.HostOf(Url);
-        return string.IsNullOrEmpty(host) ? "新标签页" : host;
+        get
+        {
+            // 注意：冷标签（从没加载过）的 Title 会一直是这个占位值，
+            // 不能只判断 IsNullOrWhiteSpace，否则休眠标签会全显示成「新标签页」。
+            bool hasRealTitle = !string.IsNullOrWhiteSpace(Title) &&
+                                Title != "about:blank" &&
+                                Title != DefaultTitle;
+            if (hasRealTitle)
+            {
+                return Title;
+            }
+            if (UrlUtils.IsInternal(Url))
+            {
+                return DefaultTitle;
+            }
+
+            // 没有真实标题时回退到域名，比显示「新标签页」有用得多
+            string host = UrlUtils.HostOf(Url);
+            if (!string.IsNullOrEmpty(host))
+            {
+                return host;
+            }
+            return UrlUtils.Ellipsis(Url, 40);
+        }
     }
 
     /// <summary>是否显示内置首页而不是真实网页。</summary>

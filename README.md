@@ -162,6 +162,8 @@ WebView2 直接销毁，并调用 `MemoryMonitor.TrimWorkingSet()`
 **浏览**
 - 地址栏智能识别：输入 `github.com` 直接访问，输入「天气」送去搜索
 - 后退 / 前进 / 刷新 / 停止 / 首页
+- **标签侧边栏**（点标签按钮或 `Ctrl+Shift+T`）：列出全部标签，显示标题、域名与存活档位
+  （绿点=渲染中 / 灰点=已休眠），可切换、单独关闭、新建、关闭全部；底部显示内存策略状态
 - 多标签：新建、关闭、切换、关闭全部、恢复上次会话（最多 20 个）
 - 无痕窗口：独立临时数据目录，关闭时整体删除
 - 页内查找（注入脚本实现，用 `window.find`）
@@ -324,7 +326,7 @@ feather-browser/
 │     ├─ ToolbarButton.cs        自绘圆角图标按钮（带数字徽标）
 │     ├─ ThemedInputs.cs         深色可用的输入框 / 下拉框 / 数字框
 │     ├─ WindowChrome.cs         请求 Windows 深色标题栏
-│     ├─ TabListPopup.cs         标签列表（圆角卡片 + 档位色点）
+│     ├─ TabsSidebar.cs          ★ 标签侧边栏（画在主窗口内，不是弹窗）
 │     ├─ PopupMenu.cs            下拉菜单（圆角面板）
 │     ├─ StatusBar.cs            自绘状态栏
 │     ├─ MemoryDialog.cs         内存与性能面板
