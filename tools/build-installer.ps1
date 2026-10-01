@@ -101,7 +101,7 @@ Get-ChildItem -LiteralPath $pub -Recurse -Directory | Sort-Object { $_.FullName.
 [IO.File]::WriteAllLines($uninstallManifest, $uninstallLines, [Text.UTF8Encoding]::new($false))
 Write-Host "==> 编译安装程序" -ForegroundColor Cyan
 $nsi = Join-Path $root 'tools\installer.nsi'
-& $makensis "/DPRODUCT_VERSION=$Version" "/DPRODUCT_FILE_VERSION=$assemblyVersion" "/DSOURCE_DIR=$pub" "/DOUT_DIR=$dist" "/DVC_REDIST=$bootstrapper" "/DUNINSTALL_MANIFEST=$uninstallManifest" $nsi
+& $makensis /INPUTCHARSET UTF8 "/DPRODUCT_VERSION=$Version" "/DPRODUCT_FILE_VERSION=$assemblyVersion" "/DSOURCE_DIR=$pub" "/DOUT_DIR=$dist" "/DVC_REDIST=$bootstrapper" "/DUNINSTALL_MANIFEST=$uninstallManifest" $nsi
 if ($LASTEXITCODE -ne 0) { throw "makensis 失败，退出码 $LASTEXITCODE" }
 
 Write-Host "==> 完成，产物：" -ForegroundColor Green
