@@ -41,8 +41,10 @@ internal static class InternalPages
 
     /// <summary>该地址是否是内置管理页。</summary>
     public static bool Handles(string url) =>
-        !string.IsNullOrEmpty(url) &&
-        url.StartsWith("https://" + Host + "/", StringComparison.OrdinalIgnoreCase);
+        Uri.TryCreate(url, UriKind.Absolute, out var uri) &&
+        uri.Scheme == "https" && uri.Host == Host && uri.IsDefaultPort &&
+        string.IsNullOrEmpty(uri.UserInfo) &&
+        uri.AbsolutePath is "/bookmarks.html" or "/downloads.html" or "/history.html";
 
     /// <summary>按地址取页面标题。</summary>
     public static string TitleFor(string url)

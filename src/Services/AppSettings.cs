@@ -99,7 +99,7 @@ public sealed class AppSettings
                 : 0];
 
     [JsonIgnore]
-    public string HomeUrl => string.IsNullOrWhiteSpace(HomePage) ? UrlUtils.InternalHome : HomePage;
+    public string HomeUrl => UrlUtils.Normalize(HomePage, Engine.Template);
 
     // ---------------- 持久化 ----------------
 

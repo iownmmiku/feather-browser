@@ -33,7 +33,6 @@ internal sealed class TabsSidebar : Control
     private int _hoverRow = -1;
 
     /// <summary>绘制次数，仅用于自检日志。</summary>
-    private int _paintCount;
     private Rectangle _newTabRect;
     private Rectangle _closeAllRect;
 

@@ -70,16 +70,10 @@ internal static class LoginAutofill
     /// 生成要注入页面的脚本。
     /// </summary>
     /// <param name="accounts">当前站点可用的账号（只含用户名，不含密码）。</param>
-    /// <returns>没有可填账号时返回空串，表示不需要注入。</returns>
-    public static string BuildScript(IEnumerable<(string Id, string Username)> accounts)
+    /// <returns>包含账号选择与表单提交监听的脚本。</returns>
+    public static string BuildScript(IEnumerable<(string Id, string Username)> accounts, string pickToken = "")
     {
         var list = accounts?.ToList() ?? new List<(string Id, string Username)>();
-        if (list.Count == 0)
-        {
-            // 站点上没有已保存的账号：什么都不用注入
-            return "";
-        }
-
         string body = Body;
         if (string.IsNullOrEmpty(body))
         {
@@ -101,6 +95,7 @@ internal static class LoginAutofill
         // 用拼接而不是替换：只有账号列表是动态的，脚本正文原样附在后面
         var sb = new StringBuilder(body.Length + accountsJs.Length + 64);
         sb.Append("(function(){if(window.__featherLogin)return;window.__featherLogin=true;")
+          .Append("var PICK_TOKEN=").Append(JsString(pickToken)).Append(';')
           .Append("var ACCOUNTS=").Append(accountsJs).Append(';')
           .Append(body)
           .Append("})();");
@@ -147,7 +142,7 @@ internal static class LoginAutofill
     }
 
     /// <summary>从宿主收到的消息里解析出类型与字段。返回 null 表示不是我们的消息。</summary>
-    public static (string Type, string Id, string Username, string Password)? ParseMessage(string json)
+    public static (string Type, string Id, string Username, string Password, string Token)? ParseMessage(string json)
     {
         if (string.IsNullOrEmpty(json) || !json.StartsWith(MessagePrefix, StringComparison.Ordinal))
         {
@@ -164,7 +159,7 @@ internal static class LoginAutofill
                     ? e.GetString()
                     : "";
 
-            return (Get("type"), Get("id"), Get("username"), Get("password"));
+            return (Get("type"), Get("id"), Get("username"), Get("password"), Get("token"));
         }
         catch (Exception ex)
         {

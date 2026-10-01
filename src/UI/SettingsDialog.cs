@@ -21,7 +21,6 @@ internal sealed class SettingsDialog : Form
     private readonly CheckBox _adBlock = new();
     private readonly CheckBox _images = new();
     private readonly CheckBox _script = new();
-    private readonly CheckBox _desktopUa = new();
     private readonly CheckBox _suspendOnDeactivate = new();
     private readonly CheckBox _autofill = new();
     private readonly ThemedNumericUpDown _maxLiveTabs = new();
@@ -153,11 +152,9 @@ internal sealed class SettingsDialog : Form
         AddCheck(grid, row++, "广告与追踪拦截", _adBlock,
             "按域名黑名单拦截，常数时间匹配，几乎不占内存");
         AddCheck(grid, row++, "加载图片", _images,
-            "关闭后用 CSS 隐藏图片，省流量也省解码内存");
+            "关闭后拦截图片请求，减少下载与解码；刷新页面后生效");
         AddCheck(grid, row++, "启用 JavaScript", _script,
             "关闭后部分网站无法正常显示");
-        AddCheck(grid, row++, "请求桌面版网站", _desktopUa,
-            "对国内视频网站通常无效");
         AddCheck(grid, row++, "窗口失焦时挂起后台标签", _suspendOnDeactivate,
             "切到别的程序时立刻释放后台标签的内存，切回来自动恢复");
         AddCheck(grid, row++, "登录表单自动填充", _autofill,
@@ -307,7 +304,6 @@ internal sealed class SettingsDialog : Form
         _adBlock.Checked = _settings.AdBlockEnabled;
         _images.Checked = _settings.LoadImages;
         _script.Checked = _settings.JavaScriptEnabled;
-        _desktopUa.Checked = _settings.DesktopUserAgent;
         _suspendOnDeactivate.Checked = _settings.SuspendOnDeactivate;
         _autofill.Checked = _settings.PasswordAutofill;
         _maxLiveTabs.Value = Math.Clamp(_settings.MaxLiveTabs, 1, 8);
@@ -322,7 +318,6 @@ internal sealed class SettingsDialog : Form
         _settings.AdBlockEnabled = _adBlock.Checked;
         _settings.LoadImages = _images.Checked;
         _settings.JavaScriptEnabled = _script.Checked;
-        _settings.DesktopUserAgent = _desktopUa.Checked;
         _settings.SuspendOnDeactivate = _suspendOnDeactivate.Checked;
         _settings.PasswordAutofill = _autofill.Checked;
         _settings.MaxLiveTabs = (int)_maxLiveTabs.Value;

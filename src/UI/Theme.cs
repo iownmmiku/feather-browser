@@ -96,6 +96,7 @@ internal static class Theme
             return;
         }
         _watching = true;
+        _uiContext = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
         try
         {
             SystemEvents.UserPreferenceChanged += (_, e) =>
@@ -105,17 +106,17 @@ internal static class Theme
                 {
                     return;
                 }
-                bool nowDark = IsSystemDark();
-                if (nowDark == _systemDark)
+                _uiContext.Post(_ =>
                 {
-                    return;
-                }
-                _systemDark = nowDark;
-                SystemThemeChanged?.Invoke();
-                if (Mode == ThemeMode.System)
-                {
-                    SetMode(ThemeMode.System);
-                }
+                    bool nowDark = IsSystemDark();
+                    if (nowDark == _systemDark) return;
+                    _systemDark = nowDark;
+                    if (Mode == ThemeMode.System)
+                    {
+                        SetMode(ThemeMode.System);
+                        SystemThemeChanged?.Invoke();
+                    }
+                }, null);
             };
         }
         catch
@@ -125,6 +126,7 @@ internal static class Theme
     }
 
     private static bool _watching;
+    private static SynchronizationContext _uiContext;
 
     // ---------------------------------------------------------------- 尺寸
 
@@ -132,7 +134,14 @@ internal static class Theme
     public static float DpiScale { get; private set; } = 1f;
 
     /// <summary>用户可调的整体界面倍率。</summary>
-    public static float Scale { get; set; } = 1.15f;
+    private static readonly float[] ScaleSteps = { 1.0f, 1.15f, 1.3f, 1.5f };
+    private static float _scale = 1.15f;
+    public static float Scale
+    {
+        get => _scale;
+        set => _scale = float.IsFinite(value)
+            ? ScaleSteps.MinBy(step => Math.Abs(step - value)) : 1.15f;
+    }
 
     /// <summary>把逻辑像素换算成物理像素（水平方向）。</summary>
     public static int Sx(float value) => (int)Math.Round(value * DpiScale * Scale);
@@ -226,6 +235,10 @@ internal static class Theme
 
     public static Font IconFontSmall { get; private set; }
 
+    // 控件与菜单会共享字体引用。四档倍率最多缓存 28 个字体，不在使用期间释放。
+    private static readonly Dictionary<float, Font[]> FontCache = new();
+    private static Font[] _currentFonts;
+
     static Theme()
     {
         _systemDark = IsSystemDark();
@@ -236,16 +249,25 @@ internal static class Theme
 
     private static void RebuildFonts()
     {
-        Font old = UiFont;
-        // 字号整体比最初版本上调一档：9pt → 10pt，小字 8pt → 9pt。
-        UiFont = CreateFont(Pt(10f), FontStyle.Regular);
-        UiFontSmall = CreateFont(Pt(9f), FontStyle.Regular);
-        UiFontBold = CreateFont(Pt(10f), FontStyle.Bold);
-        UiFontLarge = CreateFont(Pt(12.5f), FontStyle.Bold);
-        UiFontTitle = CreateFont(Pt(15f), FontStyle.Bold);
-        IconFont = CreateFont(Pt(13f), FontStyle.Regular);
-        IconFontSmall = CreateFont(Pt(11f), FontStyle.Regular);
-        old?.Dispose();
+        if (!FontCache.TryGetValue(Scale, out var fonts))
+        {
+            fonts = new[]
+            {
+                CreateFont(Pt(10f), FontStyle.Regular), CreateFont(Pt(9f), FontStyle.Regular),
+                CreateFont(Pt(10f), FontStyle.Bold), CreateFont(Pt(12.5f), FontStyle.Bold),
+                CreateFont(Pt(15f), FontStyle.Bold), CreateFont(Pt(13f), FontStyle.Regular),
+                CreateFont(Pt(11f), FontStyle.Regular),
+            };
+            FontCache.Add(Scale, fonts);
+        }
+        _currentFonts = fonts;
+        UiFont = fonts[0];
+        UiFontSmall = fonts[1];
+        UiFontBold = fonts[2];
+        UiFontLarge = fonts[3];
+        UiFontTitle = fonts[4];
+        IconFont = fonts[5];
+        IconFontSmall = fonts[6];
     }
 
     private static Font CreateFont(float size, FontStyle style)
@@ -346,9 +368,10 @@ internal static class Theme
     /// <summary>显示器的 DPI 变了，或用户改了界面倍率，重新生成字体。</summary>
     public static void RefreshFonts()
     {
-        // 先把新字体分发给所有已存在的窗口及其子控件，再重建 Theme 里的字体对象。
-        // 顺序很重要：控件不能还握着即将被释放的旧字体；TextBox 这类原生控件也不会
-        // 自动从父容器继承，必须显式递归设置。
+        var previous = _currentFonts;
+        RebuildFonts();
+        var replacements = new Dictionary<Font, Font>();
+        for (int i = 0; i < previous.Length; i++) replacements[previous[i]] = _currentFonts[i];
         var forms = new List<Form>();
         foreach (Form form in Application.OpenForms)
         {
@@ -358,8 +381,7 @@ internal static class Theme
         {
             try
             {
-                form.Font = UiFont;
-                ApplyFontRecursive(form);
+                ReplaceFonts(form, replacements);
                 form.PerformLayout();
             }
             catch
@@ -367,8 +389,6 @@ internal static class Theme
                 // 忽略
             }
         }
-
-        RebuildFonts();
 
         foreach (Form form in forms)
         {
@@ -381,6 +401,14 @@ internal static class Theme
                 // 忽略
             }
         }
+    }
+
+    private static void ReplaceFonts(Control root, Dictionary<Font, Font> replacements)
+    {
+        // 先更新子控件，避免父控件字体继承改变后丢失原来的小字/粗体档位。
+        foreach (Control child in root.Controls) ReplaceFonts(child, replacements);
+        if (replacements.TryGetValue(root.Font, out var replacement)) root.Font = replacement;
+        if (root is StatusBar status) status.FitToFont();
     }
 
     /// <summary>把窗口字体递归套到所有子控件上，并让自绘控件重新测量高度。</summary>

@@ -2,8 +2,8 @@
 ;
 ; 设计要点：
 ;   1. 打包的是自包含发布目录，用户不需要预装 .NET。
-;   2. WebView2 内核运行时按微软许可不能随程序分发，所以只做「检测 + 引导下载」：
-;      缺失时询问用户，同意就调用微软官方引导程序在线安装。
+;   2. 本项目复用系统 WebView2 运行时，只做「检测 + 引导下载」：
+;      附带经微软签名验证的引导程序，缺失时询问用户，同意再联网安装内核。
 ;   3. 应用数据在 %LOCALAPPDATA%\FeatherBrowser，卸载时询问是否一并删除。
 ;   4. 用固态 LZMA 压缩，162 MB 的目录压出来大约几十 MB。
 
@@ -20,11 +20,17 @@ SetCompressorDictSize 64
 !ifndef PRODUCT_VERSION
   !define PRODUCT_VERSION "1.0.0"
 !endif
+!ifndef PRODUCT_FILE_VERSION
+  !define PRODUCT_FILE_VERSION "${PRODUCT_VERSION}.0"
+!endif
 !ifndef SOURCE_DIR
   !define SOURCE_DIR "..\src\bin\Release\net8.0-windows\win-x64\publish"
 !endif
 !ifndef OUT_DIR
   !define OUT_DIR "..\dist"
+!endif
+!ifndef WEBVIEW2_BOOTSTRAPPER
+  !define WEBVIEW2_BOOTSTRAPPER "${OUT_DIR}\build-tools\MicrosoftEdgeWebview2Setup.exe"
 !endif
 
 !define PRODUCT_NAME "轻羽浏览器"
@@ -42,6 +48,13 @@ InstallDirRegKey HKLM "${APP_KEY}" "InstallDir"
 RequestExecutionLevel admin
 ShowInstDetails show
 ShowUninstDetails show
+VIProductVersion "${PRODUCT_FILE_VERSION}"
+VIAddVersionKey /LANG=2052 "ProductName" "${PRODUCT_NAME}"
+VIAddVersionKey /LANG=2052 "CompanyName" "${PRODUCT_PUBLISHER}"
+VIAddVersionKey /LANG=2052 "FileDescription" "${PRODUCT_NAME} 安装程序"
+VIAddVersionKey /LANG=2052 "FileVersion" "${PRODUCT_VERSION}"
+VIAddVersionKey /LANG=2052 "ProductVersion" "${PRODUCT_VERSION}"
+VIAddVersionKey /LANG=2052 "LegalCopyright" "Copyright © 2026 ${PRODUCT_PUBLISHER}"
 
 ; ---------------------------------------------------------------- 界面
 
@@ -78,6 +91,9 @@ Function CheckWebView2
   ; WebView2 运行时版本号写在两个位置：机器级与用户级，任一存在即可
   ClearErrors
   ReadRegStr $0 HKLM "SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}" "pv"
+  ${If} $0 == "0.0.0.0"
+    StrCpy $0 ""
+  ${EndIf}
   ${If} $0 == ""
     ReadRegStr $0 HKCU "SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}" "pv"
   ${EndIf}
@@ -124,6 +140,7 @@ Section "主程序" SecMain
 SectionEnd
 
 Section "WebView2 内核运行时检测" SecWebView2
+  SectionIn RO
   Call CheckWebView2
   Pop $0
 
@@ -133,34 +150,32 @@ Section "WebView2 内核运行时检测" SecWebView2
     DetailPrint "未检测到 WebView2 运行时"
     MessageBox MB_ICONEXCLAMATION|MB_YESNO \
       "本程序需要「Microsoft Edge WebView2 运行时」才能显示网页，但当前系统未安装。$\r$\n$\r$\n\
-       是否现在从微软官方网站下载并安装？（约 2 MB，需要联网）$\r$\n$\r$\n\
+       是否现在通过微软引导程序下载并安装运行时？（需要联网）$\r$\n$\r$\n\
        选择「否」也可以先完成安装，之后自行到微软官网下载安装。" \
-      IDNO SkipWebView2
+      /SD IDNO IDNO SkipWebView2
 
-    DetailPrint "正在下载 WebView2 运行时引导程序…"
-    ; NSISdl 在 64 位安装程序里需要显式设置 $INSTDIR 才能正确建立 HTTPS 证书上下文
-    SetOutPath "$INSTDIR"
-    ; 微软官方永久链接（始终指向最新稳定版引导程序）
-    NSISdl::download /TIMEOUT=30000 \
-      "https://go.microsoft.com/fwlink/p/?LinkId=2124703" \
-      "$TEMP\MicrosoftEdgeWebview2Setup.exe"
-    Pop $1
-
-    ${If} $1 == "success"
-      DetailPrint "正在安装 WebView2 运行时（静默）…"
-      ExecWait '"$TEMP\MicrosoftEdgeWebview2Setup.exe" /silent /install' $2
-      Delete "$TEMP\MicrosoftEdgeWebview2Setup.exe"
-      ${If} $2 == 0
-        DetailPrint "WebView2 运行时安装完成"
+    InitPluginsDir
+    SetOutPath "$PLUGINSDIR"
+    File /oname=MicrosoftEdgeWebview2Setup.exe "${WEBVIEW2_BOOTSTRAPPER}"
+    DetailPrint "正在安装 WebView2 运行时（静默）…"
+    ClearErrors
+    ExecWait '"$PLUGINSDIR\MicrosoftEdgeWebview2Setup.exe" /silent /install' $2
+    ${If} ${Errors}
+      MessageBox MB_ICONEXCLAMATION|MB_OK \
+        "无法启动 WebView2 引导程序，请稍后从微软官网手动安装运行时。" /SD IDOK
+    ${Else}
+      Call CheckWebView2
+      Pop $0
+      ${If} $0 != ""
+        DetailPrint "WebView2 运行时安装完成：$0"
       ${Else}
         MessageBox MB_ICONEXCLAMATION|MB_OK \
-          "WebView2 运行时安装未成功（返回码 $2）。程序仍会安装，但首次打开网页前需要手动安装运行时。"
+          "未检测到 WebView2 运行时（引导程序返回码 $2）。请稍后从微软官网手动安装：$\r$\n\
+           https://developer.microsoft.com/microsoft-edge/webview2/" /SD IDOK
       ${EndIf}
-    ${Else}
-      MessageBox MB_ICONEXCLAMATION|MB_OK \
-        "下载失败（$1）。程序仍会安装，请稍后手动安装 WebView2 运行时：$\r$\n\
-         https://developer.microsoft.com/microsoft-edge/webview2/"
     ${EndIf}
+    Delete "$PLUGINSDIR\MicrosoftEdgeWebview2Setup.exe"
+    SetOutPath "$INSTDIR"
 
     SkipWebView2:
   ${EndIf}
@@ -174,9 +189,7 @@ Section "Uninstall"
   ; 关掉正在运行的实例，否则文件删不干净
   ExecWait 'taskkill /F /IM ${PRODUCT_EXE} /T' $0
   Sleep 800
-  ; 内核子进程也要清掉，不然安装目录会残留
-  ExecWait 'taskkill /F /IM msedgewebview2.exe /T' $0
-  Sleep 500
+  ; /T 已结束轻羽的子进程；不要按 WebView2 进程名结束其它应用的内核。
 
   Delete "$INSTDIR\${PRODUCT_EXE}"
   Delete "$INSTDIR\Uninstall.exe"
@@ -195,7 +208,7 @@ Section "Uninstall"
     "是否同时删除个人数据？$\r$\n$\r$\n\
      包括书签、历史记录、设置与网页缓存（$LOCALAPPDATA\FeatherBrowser）。$\r$\n\
      选择「否」将保留，下次安装后仍可继续使用。" \
-    IDNO KeepUserData
+    /SD IDNO IDNO KeepUserData
 
   RMDir /r "$LOCALAPPDATA\FeatherBrowser"
   DetailPrint "已删除个人数据"

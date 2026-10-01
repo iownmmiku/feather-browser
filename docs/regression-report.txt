@@ -1,0 +1,19 @@
+PASS Address recognition uses the host and preserves internal/file URLs
+PASS Passwords stay within the saved scheme, host and port
+PASS Theme font refresh preserves controls and existing font references
+PASS Homepage remains internal and does not enter history
+PASS Cold background tabs do not consume the resident budget
+PASS Rapid initialization, closing and recreation obey the resident limit
+PASS A pending suspend cannot hide the reactivated tab
+PASS Image loading switch blocks the actual network request
+PASS External content cannot call the internal management bridge
+PASS Disabling website JavaScript keeps the internal pages operational
+PASS The first login submission is captured without saved accounts
+PASS Forged account selections cannot retrieve a saved password
+PASS Browser-process failure reported by a background tab revives the active tab
+PASS Private browsing does not persist history or download records
+PASS Closing the first window keeps the second window and its session
+PASS Private windows clean their temporary profile without replacing the normal session
+PASS Closing a private window during initialization still cleans its profile
+PASS Memory monitoring excludes other WebView2 environments
+Failures: 0

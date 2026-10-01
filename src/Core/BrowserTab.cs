@@ -44,6 +44,13 @@ public sealed class PageTheme
 public sealed class BrowserTab : IDisposable
 {
     private readonly TabManager _manager;
+    private bool _disposed;
+    private bool _suspendRequested;
+    private Task<bool> _suspendTask;
+    internal string CredentialPickToken { get; set; }
+    internal string CredentialSource { get; set; }
+
+    internal bool OwnsView(WebView2 view) => !_disposed && ReferenceEquals(View, view) && !view.IsDisposed;
 
     public string Id { get; } = Guid.NewGuid().ToString("N")[..8];
 
@@ -58,6 +65,7 @@ public sealed class BrowserTab : IDisposable
     public bool IsLoading { get; private set; }
 
     public int Progress { get; private set; }
+    public bool? LastNavigationSucceeded { get; private set; }
 
     public bool CanGoBack => View?.CanGoBack == true;
 
@@ -132,6 +140,10 @@ public sealed class BrowserTab : IDisposable
     /// </summary>
     internal async Task<WebView2> ObtainViewAsync(Panel host, bool forceRecreate)
     {
+        if (_disposed || host.IsDisposed)
+        {
+            return null;
+        }
         if (View != null && !forceRecreate)
         {
             return View;
@@ -156,10 +168,19 @@ public sealed class BrowserTab : IDisposable
         }
         catch (Exception ex)
         {
-            Log.Error($"标签 {Id} 的内核初始化失败", ex);
-            return view;
+            if (OwnsView(view))
+            {
+                Log.Error($"标签 {Id} 的内核初始化失败", ex);
+                DestroyView();
+            }
+            return null;
         }
 
+        // 初始化期间可能已关闭、休眠或重建；旧任务不得操作新视图。
+        if (!OwnsView(view))
+        {
+            return null;
+        }
         ApplyDeferredZoom();
         ApplyThemeToView();
 
@@ -212,8 +233,20 @@ public sealed class BrowserTab : IDisposable
     /// 再尝试；失败也不算错误 —— 调用方（<see cref="TabManager"/>）在标签数超限时
     /// 走的是直接销毁这条路，不依赖挂起成功。
     /// </summary>
-    internal async Task<bool> SuspendAsync()
+    internal Task<bool> SuspendAsync()
     {
+        _suspendRequested = true;
+        if (_suspendTask is { IsCompleted: false })
+        {
+            return _suspendTask;
+        }
+        _suspendTask = SuspendCoreAsync();
+        return _suspendTask;
+    }
+
+    private async Task<bool> SuspendCoreAsync()
+    {
+        WebView2 view = View;
         if (View?.CoreWebView2 == null)
         {
             return false;
@@ -221,7 +254,7 @@ public sealed class BrowserTab : IDisposable
 
         try
         {
-            View.Visible = false;
+            view.Visible = false;
         }
         catch
         {
@@ -230,7 +263,19 @@ public sealed class BrowserTab : IDisposable
 
         try
         {
-            bool ok = await View.CoreWebView2.TrySuspendAsync();
+            bool ok = await view.CoreWebView2.TrySuspendAsync();
+            if (!OwnsView(view))
+            {
+                return false;
+            }
+            // 用户可能在挂起请求完成前已切回这个标签。
+            if (!_suspendRequested)
+            {
+                view.CoreWebView2.Resume();
+                Life = TabLife.Live;
+                RaiseChanged();
+                return false;
+            }
             if (ok)
             {
                 Life = TabLife.Suspended;
@@ -252,6 +297,7 @@ public sealed class BrowserTab : IDisposable
     /// <summary>从挂起状态恢复。</summary>
     internal void Resume()
     {
+        _suspendRequested = false;
         if (View?.CoreWebView2 == null)
         {
             return;
@@ -259,7 +305,7 @@ public sealed class BrowserTab : IDisposable
         try
         {
             View.CoreWebView2.Resume();
-            View.Visible = true;
+            View.Visible = this == _manager.Active;
             Life = TabLife.Live;
             RaiseChanged();
         }
@@ -274,9 +320,14 @@ public sealed class BrowserTab : IDisposable
     {
         WebView2 view = View;
         View = null;
+        CredentialPickToken = null;
+        CredentialSource = null;
+        _suspendRequested = false;
+        _suspendTask = null;
         Life = TabLife.Cold;
         IsLoading = false;
         Progress = 0;
+        LastNavigationSucceeded = null;
 
         if (view == null)
         {
@@ -293,7 +344,6 @@ public sealed class BrowserTab : IDisposable
             {
                 // 忽略
             }
-            view.Stop();
             if (view.Parent is Control parent)
             {
                 parent.Controls.Remove(view);
@@ -306,7 +356,6 @@ public sealed class BrowserTab : IDisposable
         }
 
         RaiseChanged();
-        MemoryMonitor.TrimWorkingSet();
     }
 
     // ---------------------------------------------------------------- 导航
@@ -314,6 +363,7 @@ public sealed class BrowserTab : IDisposable
     /// <summary>加载给定地址（会自动识别内置首页）。</summary>
     public void NavigateTo(string url)
     {
+        if (_disposed) return;
         Url = string.IsNullOrWhiteSpace(url) ? UrlUtils.InternalHome : url;
         Touch();
 
@@ -347,6 +397,10 @@ public sealed class BrowserTab : IDisposable
 
         try
         {
+            LastNavigationSucceeded = null;
+            IsLoading = true;
+            Progress = 5;
+            RaiseChanged();
             if (isHtml)
             {
                 Log.Info($"导航到内置首页 (HTML {target.Length} 字节)");
@@ -367,7 +421,11 @@ public sealed class BrowserTab : IDisposable
         }
         catch (Exception ex)
         {
+            LastNavigationSucceeded = false;
+            IsLoading = false;
+            Progress = 0;
             Log.Error($"导航失败: {target}", ex);
+            RaiseChanged();
         }
     }
 
@@ -399,7 +457,11 @@ public sealed class BrowserTab : IDisposable
         {
             Resume();
         }
-        View.CoreWebView2?.Reload();
+        if (View.CoreWebView2 != null)
+        {
+            LastNavigationSucceeded = null;
+            View.CoreWebView2.Reload();
+        }
     }
 
     public void Stop()
@@ -494,7 +556,21 @@ public sealed class BrowserTab : IDisposable
 
         core.NavigationStarting += (_, e) =>
         {
+            if (!OwnsView(view)) return;
+            CredentialPickToken = null;
+            CredentialSource = null;
+            if (e.Uri.StartsWith("feather://search?q=", StringComparison.OrdinalIgnoreCase))
+            {
+                e.Cancel = true;
+                string query = Uri.UnescapeDataString(e.Uri["feather://search?q=".Length..]);
+                string target = UrlUtils.Normalize(query, _manager.Settings.Engine.Template);
+                view.BeginInvoke(() => { if (OwnsView(view)) NavigateTo(target); });
+                return;
+            }
+            core.Settings.IsScriptEnabled = _manager.Settings.JavaScriptEnabled ||
+                UrlUtils.IsInternal(e.Uri) || (IsHomePage && e.Uri == "about:blank");
             IsLoading = true;
+            LastNavigationSucceeded = null;
             Progress = 5;
             _manager.NotifyNavigationStarting(this, e.Uri);
             RaiseChanged();
@@ -502,11 +578,13 @@ public sealed class BrowserTab : IDisposable
 
         core.SourceChanged += (_, _) =>
         {
+            if (!OwnsView(view)) return;
             try
             {
                 string source = core.Source;
                 if (!string.IsNullOrEmpty(source) &&
-                    !source.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
+                    !source.StartsWith("data:", StringComparison.OrdinalIgnoreCase) &&
+                    !(IsHomePage && source.Equals("about:blank", StringComparison.OrdinalIgnoreCase)))
                 {
                     Url = source;
                 }
@@ -519,6 +597,7 @@ public sealed class BrowserTab : IDisposable
 
         core.DocumentTitleChanged += (_, _) =>
         {
+            if (!OwnsView(view)) return;
             try
             {
                 string title = core.DocumentTitle;
@@ -536,7 +615,9 @@ public sealed class BrowserTab : IDisposable
 
         core.NavigationCompleted += (_, e) =>
         {
+            if (!OwnsView(view)) return;
             IsLoading = false;
+            LastNavigationSucceeded = e.IsSuccess;
             Progress = 100;
             if (e.IsSuccess)
             {
@@ -554,28 +635,6 @@ public sealed class BrowserTab : IDisposable
         core.FaviconChanged += (_, _) => RaiseChanged();
 
         core.HistoryChanged += (_, _) => RaiseChanged();
-
-        // 图片开关：用 CSS 隐藏而不是拦截请求。
-        // 拦截请求仍然会消耗流量与带宽，隐藏则是零网络代价。
-        core.DOMContentLoaded += async (_, _) =>
-        {
-            if (_manager.Settings.LoadImages)
-            {
-                return;
-            }
-            try
-            {
-                await core.ExecuteScriptAsync(
-                    "(function(){var s=document.getElementById('__feather_noimg');" +
-                    "if(s)return;s=document.createElement('style');s.id='__feather_noimg';" +
-                    "s.textContent='img,picture,video,[style*=\"background-image\"]{display:none !important}';" +
-                    "document.documentElement.appendChild(s);})()");
-            }
-            catch
-            {
-                // 注入失败不影响网页本身
-            }
-        };
 
         core.NewWindowRequested += (_, e) =>
         {
@@ -602,8 +661,10 @@ public sealed class BrowserTab : IDisposable
         // 但那个标签已经是死壳子。必须让宿主知道，才能自动恢复或给出提示，
         // 而不是留一个「点了没反应也说不清哪坏了」的界面。
         core.ProcessFailed += (_, e) =>
-            _manager.NotifyProcessFailed(this, e.ProcessFailedKind.ToString(),
-                e.Reason.ToString());
+        {
+            if (OwnsView(view))
+                _manager.NotifyProcessFailed(this, e.ProcessFailedKind.ToString(), e.Reason.ToString());
+        };
 
         // 登录表单自动填充与内置管理页：页面发回的消息都在这里分流
         core.WebMessageReceived += (_, e) =>
@@ -619,19 +680,24 @@ public sealed class BrowserTab : IDisposable
 
             try
             {
+                if (!OwnsView(view) || !string.Equals(e.Source, core.Source, StringComparison.Ordinal)) return;
                 string raw = e.TryGetWebMessageAsString();
                 if (debug)
                 {
-                    Log.Info($"页面消息原文: {raw}");
+                    Log.Info($"页面消息长度: {raw?.Length ?? 0}");
                 }
 
                 // 内置管理页的消息是 JSON 对象（以 { 开头），自动填充的是自己的紧凑格式
                 if (!string.IsNullOrEmpty(raw) && raw.TrimStart().StartsWith("{"))
                 {
-                    _manager.NotifyInternalPageMessage(this, raw);
+                    if (InternalPages.Handles(e.Source))
+                        _manager.NotifyInternalPageMessage(this, raw, e.Source);
                     return;
                 }
 
+                if (!_manager.Settings.PasswordAutofill || IsIncognito ||
+                    !Uri.TryCreate(e.Source, UriKind.Absolute, out var sourceUri) ||
+                    (sourceUri.Scheme != "https" && sourceUri.Scheme != "http")) return;
                 var parsed = LoginAutofill.ParseMessage(raw);
                 if (parsed == null)
                 {
@@ -640,10 +706,12 @@ public sealed class BrowserTab : IDisposable
                 switch (parsed.Value.Type)
                 {
                     case "pick":
-                        _manager.NotifyCredentialPicked(this, parsed.Value.Id);
+                        if (!string.IsNullOrEmpty(CredentialPickToken) &&
+                            parsed.Value.Token == CredentialPickToken && e.Source == CredentialSource)
+                            _manager.NotifyCredentialPicked(this, parsed.Value.Id);
                         break;
                     case "submit":
-                        _manager.NotifyCredentialSubmitted(this, parsed.Value.Username,
+                        _manager.NotifyCredentialSubmitted(this, e.Source, parsed.Value.Username,
                             parsed.Value.Password);
                         break;
                 }
@@ -669,7 +737,9 @@ public sealed class BrowserTab : IDisposable
                 {
                     return;
                 }
-                if (!_manager.AdBlock.ShouldBlock(e.Request.Uri, false))
+                bool blockImage = !_manager.Settings.LoadImages &&
+                    e.ResourceContext == CoreWebView2WebResourceContext.Image;
+                if (!blockImage && !_manager.AdBlock.ShouldBlock(e.Request.Uri, false))
                 {
                     return;
                 }
@@ -705,5 +775,10 @@ public sealed class BrowserTab : IDisposable
         }
     }
 
-    public void Dispose() => DestroyView();
+    public void Dispose()
+    {
+        _disposed = true;
+        DestroyView();
+        Changed = null;
+    }
 }

@@ -6,16 +6,24 @@ namespace FeatherBrowser;
 
 internal static class Program
 {
+    internal static BrowserApplicationContext Windows { get; private set; }
     [STAThread]
     private static void Main(string[] args)
     {
         // 数据目录覆盖必须在任何 AppPaths.Root 访问之前生效
+        bool dataDirectorySpecified = false;
         foreach (string arg in args)
         {
             if (arg.StartsWith("--data-dir=", StringComparison.OrdinalIgnoreCase))
             {
                 AppPaths.OverrideRoot(arg["--data-dir=".Length..].Trim('"'));
+                dataDirectorySpecified = true;
             }
+        }
+
+        if (!dataDirectorySpecified && args.Length > 0 && args[0].Equals("--selftest", StringComparison.OrdinalIgnoreCase))
+        {
+            AppPaths.OverrideRoot(Path.Combine(Path.GetTempPath(), "FeatherSelfTest_" + Guid.NewGuid().ToString("N")));
         }
 
         AppPaths.EnsureCreated();
@@ -101,16 +109,9 @@ internal static class Program
         }
 
         using var form = new MainForm(startUrl, incognito: false, themeOverride, uiTest);
-        Application.Run(form);
-
-        // 退出时保存会话与历史
-        try
-        {
-            form.PersistSession();
-        }
-        catch (Exception ex)
-        {
-            Log.Error("退出时保存会话失败", ex);
-        }
+        using var windows = new BrowserApplicationContext();
+        Windows = windows;
+        windows.OpenWindow(form);
+        Application.Run(windows);
     }
 }

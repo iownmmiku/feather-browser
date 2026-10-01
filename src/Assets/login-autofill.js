@@ -1,6 +1,4 @@
 // 轻羽浏览器：页面内的登录表单辅助脚本（由 LoginAutofill 注入）。
-// 注意：本文件里不允许出现“连续两个引号”，因为宿主是用 C# 逐字字符串包住它的。
-// 需要空字符串时请写 String()。
 
 function featherVisible(el) {
   if (!el || el.disabled || el.readOnly) return false;
@@ -80,12 +78,13 @@ function featherShow(anchor) {
       'overflow:hidden;text-overflow:ellipsis';
     row.onmouseenter = function () { row.style.background = '#e8efff'; };
     row.onmouseleave = function () { row.style.background = 'transparent'; };
-    row.onmousedown = function (e) {
+    row.addEventListener('mousedown', function (e) {
+      if (!(e instanceof MouseEvent) || !e.isTrusted || e.button !== 0) return;
       e.preventDefault();
       e.stopPropagation();
-      featherPost({ type: 'pick', id: a.id });
+      featherPost({ type: 'pick', id: a.id, token: PICK_TOKEN });
       featherHide();
-    };
+    });
     featherBox.appendChild(row);
   });
 
@@ -133,4 +132,13 @@ document.addEventListener('keydown', function (e) {
 }, true);
 
 // 提交登录时把用户当前输入的值发回宿主，用于询问是否保存
-var featherSubmitted = false;
+var featherLastSubmit = 0;
+document.addEventListener('submit', function (e) {
+  var form = e.target;
+  if (!form || form.tagName !== 'FORM') return;
+  var pw = Array.prototype.find.call(form.querySelectorAll('input[type=password]'), featherVisible);
+  if (!pw || !pw.value || Date.now() - featherLastSubmit < 1000) return;
+  featherLastSubmit = Date.now();
+  var user = featherUserField(pw);
+  featherPost({ type: 'submit', username: user ? user.value : String(), password: pw.value });
+}, true);

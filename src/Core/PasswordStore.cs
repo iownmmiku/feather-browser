@@ -71,7 +71,6 @@ public sealed class PasswordFile
 public sealed class PasswordStore
 {
     private readonly List<PasswordEntry> _entries = new();
-    private Dictionary<string, List<PasswordEntry>> _byDomain;
 
     public PasswordStore()
     {
@@ -103,12 +102,18 @@ public sealed class PasswordStore
             return;
         }
 
+        origin = UrlUtils.OriginOf(origin);
+        if (!Uri.TryCreate(origin, UriKind.Absolute, out var uri) ||
+            (uri.Scheme != "https" && uri.Scheme != "http")) return;
         string domain = UrlUtils.RegistrableDomain(origin);
-        byte[] protectedBytes = Dpapi.Protect(Encoding.UTF8.GetBytes(password));
+        byte[] plain = Encoding.UTF8.GetBytes(password);
+        byte[] protectedBytes;
+        try { protectedBytes = Dpapi.Protect(plain); }
+        finally { System.Security.Cryptography.CryptographicOperations.ZeroMemory(plain); }
         string encoded = Convert.ToBase64String(protectedBytes);
 
         int index = _entries.FindIndex(e =>
-            string.Equals(e.Domain, domain, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(UrlUtils.OriginOf(e.Origin), origin, StringComparison.OrdinalIgnoreCase) &&
             string.Equals(e.Username, username ?? "", StringComparison.Ordinal));
 
         if (index >= 0)
@@ -130,7 +135,6 @@ public sealed class PasswordStore
             });
         }
 
-        _byDomain = null;
         SaveToDisk();
     }
 
@@ -139,7 +143,6 @@ public sealed class PasswordStore
         if (index >= 0 && index < _entries.Count)
         {
             _entries.RemoveAt(index);
-            _byDomain = null;
             SaveToDisk();
         }
     }
@@ -147,7 +150,6 @@ public sealed class PasswordStore
     public void Clear()
     {
         _entries.Clear();
-        _byDomain = null;
         SaveToDisk();
     }
 
@@ -179,7 +181,7 @@ public sealed class PasswordStore
     // ---------------------------------------------------------------- 站点匹配
 
     /// <summary>
-    /// 找出适用于某个网址的凭据。匹配顺序：同域名优先，其次同 origin。
+    /// 按完整 origin 匹配，防止凭据流向其它子域、端口或 HTTP 页面。
     /// </summary>
     public List<PasswordEntry> FindForUrl(string url)
     {
@@ -189,37 +191,18 @@ public sealed class PasswordStore
             return result;
         }
 
-        string host = UrlUtils.RawHostOf(url);
-        string domain = UrlUtils.RegistrableDomain(url);
-        if (string.IsNullOrEmpty(host))
+        string origin = UrlUtils.OriginOf(url);
+        if (!Uri.TryCreate(origin, UriKind.Absolute, out var uri) ||
+            (uri.Scheme != "https" && uri.Scheme != "http"))
         {
             return result;
         }
 
-        EnsureIndex();
-
-        // 先精确命中主机（含子域）
         foreach (PasswordEntry entry in _entries)
         {
-            if (string.Equals(entry.Domain, domain, StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(UrlUtils.OriginOf(entry.Origin), origin, StringComparison.OrdinalIgnoreCase))
             {
                 result.Add(entry);
-            }
-        }
-
-        // 子域与主域互相兼容：mail.example.com 也能用 example.com 的凭据
-        if (result.Count == 0 && !string.IsNullOrEmpty(domain))
-        {
-            string parent = UrlUtils.ParentDomain(host);
-            if (!string.IsNullOrEmpty(parent))
-            {
-                foreach (PasswordEntry entry in _entries)
-                {
-                    if (string.Equals(entry.Domain, parent, StringComparison.OrdinalIgnoreCase))
-                    {
-                        result.Add(entry);
-                    }
-                }
             }
         }
 
@@ -228,25 +211,6 @@ public sealed class PasswordStore
 
     /// <summary>这个站点是否已经存过账号（用于决定要不要提示「保存」）。</summary>
     public bool HasForUrl(string url) => FindForUrl(url).Count > 0;
-
-    private void EnsureIndex()
-    {
-        if (_byDomain != null)
-        {
-            return;
-        }
-        var map = new Dictionary<string, List<PasswordEntry>>(StringComparer.OrdinalIgnoreCase);
-        foreach (PasswordEntry entry in _entries)
-        {
-            if (!map.TryGetValue(entry.Domain, out List<PasswordEntry> list))
-            {
-                list = new List<PasswordEntry>();
-                map[entry.Domain] = list;
-            }
-            list.Add(entry);
-        }
-        _byDomain = map;
-    }
 
     // ---------------------------------------------------------------- 落盘
 

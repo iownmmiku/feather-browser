@@ -41,12 +41,13 @@
     <FileDescription>轻羽浏览器</FileDescription>
     <Company>FeatherBrowser</Company>
     <Copyright>Copyright © 2026 FeatherBrowser</Copyright>
-    <Version>1.4.0</Version>
-    <FileVersion>1.4.0.0</FileVersion>
-    <AssemblyVersion>1.4.0.0</AssemblyVersion>
+    <Version>1.4.1</Version>
+    <FileVersion>1.4.1.0</FileVersion>
+    <AssemblyVersion>1.4.1.0</AssemblyVersion>
   </PropertyGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="FeatherBrowser.Tests" />
     <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.2903.40" />
     <!-- 读夸克的 History / Login Data 需要读 SQLite。用它而不是自写解析器：
          后者要处理 B 树、溢出页、WAL，出错了会静默读出错数据，不值得。 -->
@@ -72,7 +73,8 @@
     2) 不要只从发布清单里剔除 WPF 程序集。PresentationFramework/PresentationCore
        确实用不到（约 25 MB），但 FeatherBrowser.deps.json 仍会声明它们，
        运行时按清单加载却找不到文件，直接 0xC0000005 崩溃。
-       要么连清单一起改，要么不动 —— 目前选择不动。
+       当前 Directory.Build.targets 在依赖解析前移除未使用的 WebView2.Wpf 引用，
+       构建依赖清单会同步更新，避免 WindowsBase 版本冲突。
 
     实际压小体积靠 NSIS 的固态 LZMA 压缩（见 tools/installer.nsi）。
   -->

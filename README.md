@@ -5,7 +5,7 @@ Windows 上的轻量浏览器，界面形态参考安卓端 **Via 浏览器**：
 
 - **内核**：系统自带的 Microsoft Edge WebView2 运行时（不随程序打包 Chromium）
 - **外壳**：.NET 8 WinForms，程序自身托管代码约 170 KB
-- **安装包**：46 MB（自包含 .NET 运行时，用户无需预装任何环境）
+- **安装包**：自包含 .NET 运行时，用户无需预装 .NET；WebView2 缺失时引导安装
 - **平台**：Windows 10 / 11，64 位
 
 | 浅色 | 深色 |
@@ -23,9 +23,8 @@ Windows 上的轻量浏览器，界面形态参考安卓端 **Via 浏览器**：
 
 1. 释放程序文件到 `%ProgramFiles%\Feather Browser`；
 2. 创建开始菜单与桌面快捷方式；
-3. **检测 WebView2 运行时**——缺失时会询问是否从微软官方地址下载安装
-   （约 2 MB，需联网）。这个运行时是显示网页所必需的，按微软许可不能随本程序分发，
-   所以只做检测与引导；
+3. **检测 WebView2 运行时**——缺失时会询问是否通过附带的微软签名引导程序联网安装。
+   这个运行时是显示网页所必需的，本项目只做检测与引导安装；
 4. 注册卸载信息，可在「设置 → 应用 → 已安装的应用」中卸载。
    卸载时会询问是否一并删除书签、历史等个人数据。
 
@@ -38,11 +37,15 @@ Windows 上的轻量浏览器，界面形态参考安卓端 **Via 浏览器**：
 dotnet build .\src\FeatherBrowser.csproj -c Release
 
 # 2) 生成自包含发布 + 安装程序（需要 NSIS 3，默认装在 C:\Program Files (x86)\NSIS）
-.\tools\build-installer.ps1 -Version 1.0.0
+.\tools\build-installer.ps1
+
+# 也可以指定版本号或免安装版 NSIS 编译器路径
+.\tools\build-installer.ps1 -Version 1.4.1 -MakensisPath C:\Tools\nsis\makensis.exe
 ```
 
 `build-installer.ps1` 会先做自包含发布（`win-x64`），再调用 NSIS 打包，
-产物落在 `dist\` 目录。
+默认读取项目版本号，产物落在 `dist\` 目录。打包时会下载微软 WebView2 引导程序并验证
+其 Authenticode 签名；只生成自包含目录时可使用 `-SkipInstaller`。
 
 ## 三、内存占用怎么压下来的
 
@@ -78,15 +81,15 @@ dotnet build .\src\FeatherBrowser.csproj -c Release
 
 切到别的程序时，看不见的网页继续渲染毫无意义。
 [`MainForm.OnDeactivated`](src/UI/MainForm.cs) 会调用 `SuspendBackgroundTabs()`，
-把这些不可见的后台标签挂起；窗口重新激活时恢复。这类调用里 `TrySuspendAsync` 是可靠的，
-因为视图本来就不在屏幕上。
+把这些不可见的后台标签挂起；切回具体标签时再恢复。挂起请求与标签激活之间也做了同步，
+避免异步挂起刚完成就把当前页面藏起来。
 
 ### 3. 可手动触发回收
 
 菜单里的「立即回收标签内存」调用 `TabManager.ReclaimNow()`：把所有非当前标签的
 WebView2 直接销毁，并调用 `MemoryMonitor.TrimWorkingSet()`
-（紧凑 GC + `EmptyWorkingSet`）把已经空出来的工作集立刻还给系统，
-让任务管理器里的数字和真实占用一致，而不是虚高。
+（GC + `EmptyWorkingSet`）主动回收外壳工作集。普通标签切换与自动休眠只销毁视图，
+不再逐个强制 GC 或清空工作集，减少切换停顿与随后重新调入内存的开销。
 
 ### 4. 大量使用自绘控件
 
@@ -108,10 +111,10 @@ WebView2 直接销毁，并调用 `MemoryMonitor.TrimWorkingSet()`
 程序只引用 `Microsoft.Web.WebView2`，运行时复用系统已安装的 Edge WebView2 运行时。
 **内核文件在系统里只存一份**，装多少基于 WebView2 的程序都共享。
 
-### 7. 图片开关用 CSS 而不是拦截请求
+### 7. 图片开关拦截实际图片请求
 
-关闭「加载图片」时，程序在 `DOMContentLoaded` 后注入一条 CSS 规则隐藏图片元素。
-图片仍然会被下载，但不再解码、不再占位图内存——对「内存优先」的场景比拦截请求更省内存。
+关闭「加载图片」时，在 `WebResourceRequested` 中给图片请求返回空响应，
+避免下载这些网络图片。设置变化后刷新页面生效；已经加载的资源与内联图片不在此拦截范围内。
 
 ### 8. 多窗口共用一套内核与数据
 
@@ -127,8 +130,9 @@ WebView2 直接销毁，并调用 `MemoryMonitor.TrimWorkingSet()`
 其余窗口复用（并发创建用信号量串行化）。**无痕窗口是唯一例外**：它有自己的临时数据目录，
 所以单独建一个环境，关闭时整个目录删除。
 
-多窗口也顺带解决了「最后一个窗口关闭才退出」的问题：窗口关闭时数一遍还剩几个 `MainForm`，
-只有最后一个才保存会话并调 `Application.Exit()`。
+消息循环由 `BrowserApplicationContext` 跟随所有浏览器窗口管理，关闭最早打开的窗口后，
+其余窗口可以继续使用。普通窗口在销毁标签之前保存会话，下次启动恢复最后关闭的普通窗口；
+无痕窗口不覆盖普通会话，并在临时数据清理结束后完成退出。
 
 > 多窗口让内存统计变得更好看：任务管理器里只有一个 `FeatherBrowser.exe`，
 > 内核子进程数随标签数变化而不是随窗口数翻倍。
@@ -202,7 +206,7 @@ WebView2 直接销毁，并调用 `MemoryMonitor.TrimWorkingSet()`
 
 ### 主题：浅色 / 深色 / 跟随系统
 
-设置里或菜单里切换（快捷键 `Ctrl+J` 循环），三种模式：
+设置里或菜单里切换，三种模式（`Ctrl+J` 用于打开下载内容）：
 
 | 模式 | 行为 |
 |---|---|
@@ -322,14 +326,16 @@ FeatherBrowser.exe --import-quark=passwords
 
 | 时机 | 行为 |
 |---|---|
-| 页面加载完成 | 若该站点有已保存账号，注入一段辅助脚本 |
+| 页面加载完成 | 注入登录提交监听；有已保存账号时同时提供账号选择 |
 | 点击用户名 / 密码框 | 弹出「轻羽已保存的账号」列表，**只显示用户名** |
 | 点选某个账号 | 宿主动作：单独注入一次脚本，把密码填进去 |
 | 提交登录表单 | 若还没保存过这个账号，询问是否保存 |
 
 **安全上的关键取舍**：注入页面的脚本里**只有用户名，没有密码**。
 密码要等你点选之后，由宿主单独执行一次脚本填入。
-所以即使页面里有恶意脚本，它也拿不到你保存的密码 —— 除非你自己点它。
+账号选择仅接受真实鼠标事件，并用当前文档的随机令牌校验请求。
+凭据按完整来源（协议、主机、端口）匹配，避免填入同一父域下的其他站点。
+填入 DOM 后，当前页面的脚本仍能读取输入框内容，因此应当只在可信页面上选择填充。
 
 这条设计有个直接后果：**不会「打开页面就自动填好」**。
 对个人电脑方便性略差，但避免了页面一加载就把密码交给 DOM。
@@ -358,7 +364,9 @@ FeatherBrowser.exe --import-quark=passwords
 
 ## 九、实测数据
 
-自检报告见 [`docs/selftest-report.txt`](docs/selftest-report.txt)。
+旧版内存自检报告见 [`docs/selftest-report.txt`](docs/selftest-report.txt)，其进程统计包含其他程序的
+WebView2，不能作为当前版本的内存基准。现有统计按本程序使用的环境收集进程 ID，并跨窗口去重。
+本轮修复与回归验证见 [`docs/fixes-2026-10-01.md`](docs/fixes-2026-10-01.md)。
 它连续打开 5 个真实网站（example.com / Bing / 百度 / cn.bing / 搜狗），
 每打开一个就采样一次内存，报告里还带有内存策略的逐步决策轨迹。
 
@@ -366,7 +374,7 @@ FeatherBrowser.exe --import-quark=passwords
 .\src\bin\Release\net8.0-windows\FeatherBrowser.exe --selftest report.txt
 ```
 
-结论（以本机实测报告为准）：
+以下是旧版报告中的历史结果，不代表本轮修复后的实测值：
 
 - **同时处于「渲染中」的标签始终不超过设定的上限（默认 2 个）**，第 3 个及以后的标签全部休眠；
 - 内核工作集：只有 1 个标签时约 483 MB，开着 5 个标签时约 601 MB，**增量约 +117 MB**；
@@ -375,9 +383,7 @@ FeatherBrowser.exe --import-quark=passwords
 
 需要注意：
 
-- 系统里 `msedgewebview2.exe` 的绝对进程数会包含 Edge 自身已经常驻的后台进程
-  （本机空闲时就有 6 个），所以判断内存高低应当看**打开更多标签带来的增量**，
-  而不是孤立看总进程数；
+- 旧版统计包含其他程序的 WebView2；当前版本只统计本程序所使用环境的进程；
 - 工作集统计包含多个进程共享的页面，所以增量会小于各进程工作集之和；
 - 系统可用内存会受其它程序影响而上下浮动，只能作参考。
 
@@ -452,12 +458,17 @@ $env:FEATHER_UITEST_DELAY='2000'   # 控制弹层延时（毫秒）
 # 内存自检
 FeatherBrowser.exe --selftest report.txt
 
+# 本地回归测试（自动创建独立临时数据目录，不依赖外部网站）
+dotnet run --project tests/FeatherBrowser.Tests.csproj -c Release
+
 # 从夸克导入（也可在界面里做）
 FeatherBrowser.exe --import-quark=all;2000 --import-report=报告.txt
 
 # 把数据写到别的目录（隔离测试用，不动真实数据）
 FeatherBrowser.exe --data-dir=D:\tmp\feather-test
 ```
+
+内存自检未指定 `--data-dir` 时也使用独立临时目录，避免诊断网站写入日常浏览记录。
 
 ### 换图标
 

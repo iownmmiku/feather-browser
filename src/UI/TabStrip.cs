@@ -31,7 +31,6 @@ internal sealed class TabStrip : Control
     private int _hoverIndex = -1;
     private bool _hoverClose;
     private bool _hoverNew;
-    private int _hoverNewTab = -1;
 
     /// <summary>拖动排序状态：按下后移动超过阈值才进入拖动，避免和单击冲突。</summary>
     private int _dragIndex = -1;

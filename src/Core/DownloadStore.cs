@@ -17,10 +17,13 @@ public sealed class DownloadStore
     private readonly List<DownloadItem> _items = new();
     private readonly string _file;
 
-    public DownloadStore()
+    public DownloadStore(bool persist = true)
     {
-        _file = Path.Combine(AppPaths.Root, "downloads.json");
-        Load();
+        if (persist)
+        {
+            _file = Path.Combine(AppPaths.Root, "downloads.json");
+            Load();
+        }
     }
 
     /// <summary>默认下载目录（跟随系统设置，通常就是「下载」文件夹）。</summary>
@@ -206,6 +209,7 @@ public sealed class DownloadStore
 
     public void Save()
     {
+        if (_file == null) return;
         try
         {
             List<DownloadItem> copy;

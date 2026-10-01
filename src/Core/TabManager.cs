@@ -26,6 +26,7 @@ public sealed class TabManager
     private CoreWebView2Environment _environment;
     private bool _suspendedAll;
     private bool _activating;
+    private bool _shutdown;
 
     /// <summary>被激活/挂起/销毁时触发，供界面刷新。</summary>
     public event Action TabsChanged;
@@ -64,7 +65,7 @@ public sealed class TabManager
         ContextMenuRequested;
 
     /// <summary>需要询问用户是否保存登录凭据时触发（账号, 密码）。</summary>
-    public event Action<BrowserTab, string, string> SaveCredentialRequested;
+    public event Action<BrowserTab, string, string, string> SaveCredentialRequested;
 
     public bool IsIncognito { get; }
 
@@ -176,7 +177,7 @@ public sealed class TabManager
     }
 
     public TabManager(BrowserContext context, Panel viewHost, Panel parking,
-        Control uiInvoker, bool incognito, string temporaryDataFolder)
+        Control uiInvoker, bool incognito, string temporaryDataFolder, DownloadStore downloads = null)
     {
         _context = context;
         Settings = context.Settings;
@@ -184,7 +185,7 @@ public sealed class TabManager
         History = context.History;
         Bookmarks = context.Bookmarks;
         Passwords = context.Passwords;
-        Downloads = context.Downloads;
+        Downloads = downloads ?? (incognito ? new DownloadStore(persist: false) : context.Downloads);
         _viewHost = viewHost;
         _parking = parking;
         _uiInvoker = uiInvoker;
@@ -202,8 +203,7 @@ public sealed class TabManager
         string userDataFolder, bool forceDarkPages)
     {
         var options = new CoreWebView2EnvironmentOptions(
-            "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection " +
-            "--disable-background-timer-throttling=false " +
+            "--disable-features=msWebOOUI,msPdfOOUI " +
             // 让内核子进程继承本程序的身份，任务管理器里才会归到「轻羽浏览器」名下，
             // 而不是显示成一堆 msedgewebview2
             $"--app-user-model-id={AppIdentity.AppUserModelId}")
@@ -261,6 +261,7 @@ public sealed class TabManager
     /// </summary>
     public async Task InitializeAsync()
     {
+        if (_shutdown) return;
         if (_environment != null)
         {
             return;
@@ -274,6 +275,7 @@ public sealed class TabManager
         {
             _environment = await _context.GetEnvironmentAsync(PageTheme.ForceDark);
         }
+        if (!_shutdown) MemoryMonitor.RegisterEnvironment(_environment);
     }
 
     /// <summary>
@@ -305,6 +307,7 @@ public sealed class TabManager
 
     public BrowserTab NewTab(string url, bool activate = true)
     {
+        ObjectDisposedException.ThrowIf(_shutdown, this);
         var tab = new BrowserTab(this, url, IsIncognito);
         tab.Changed += _ => TabsChanged?.Invoke();
         _tabs.Add(tab);
@@ -342,7 +345,7 @@ public sealed class TabManager
     /// </summary>
     public void Activate(BrowserTab tab)
     {
-        if (tab == null || !_tabs.Contains(tab))
+        if (_shutdown || tab == null || !_tabs.Contains(tab))
         {
             return;
         }
@@ -379,6 +382,9 @@ public sealed class TabManager
                 }
             }
 
+            // 在创建之前腾出预算，快速切换期间也不额外驻留视图。
+            EnforceMemoryPolicy();
+
             // 创建/唤起 WebView2。这里是异步的（要等内核就绪），
             // 因此不 await：界面先切过去，页面在几十毫秒后开始加载。
             bool needCreate = tab.View == null;
@@ -398,10 +404,8 @@ public sealed class TabManager
                     _viewHost.Controls.Add(view);
                 }
                 view.BringToFront();
-                if (tab.Life == TabLife.Suspended)
-                {
-                    tab.Resume();
-                }
+                tab.Resume();
+                view.Visible = true;
             }
         }
         finally
@@ -498,7 +502,7 @@ public sealed class TabManager
     /// </summary>
     public void EnforceMemoryPolicy()
     {
-        if (_tabs.Count == 0)
+        if (_shutdown || _tabs.Count == 0)
         {
             return;
         }
@@ -522,6 +526,8 @@ public sealed class TabManager
 
         foreach (BrowserTab tab in ordered)
         {
+            // 尚未加载的后台标签不占驻留名额。
+            if (tab != active && tab.View == null) continue;
             // 关键：当前标签即使「视图还没建好」也要占住名额。
             // 它马上会在 ObtainViewAsync 里创建内核，如果这里跳过不计，
             // 等它创建完就会悄悄多出一个渲染中的标签，突破上限。
@@ -529,7 +535,7 @@ public sealed class TabManager
 
             if (wantsLive)
             {
-                if (tab.Life == TabLife.Suspended && tab.View != null)
+                if (tab == active && tab.View != null)
                 {
                     tab.Resume();
                 }
@@ -612,11 +618,46 @@ public sealed class TabManager
     /// <summary>WebView2 环境的释放由窗口负责；这里只销毁各标签的控件。</summary>
     public void Shutdown()
     {
+        if (_shutdown) return;
+        _shutdown = true;
+        if (_environment != null) MemoryMonitor.UnregisterEnvironment(_environment);
         foreach (BrowserTab tab in _tabs)
         {
             tab.Dispose();
         }
         _tabs.Clear();
+        ActiveIndex = -1;
+    }
+
+    internal async Task ReleasePrivateEnvironmentAsync()
+    {
+        if (!IsIncognito || _environment == null) return;
+        var exited = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        uint browserId = 0;
+        void OnExited(object sender, CoreWebView2BrowserProcessExitedEventArgs e)
+        {
+            if (e.BrowserProcessId == browserId) exited.TrySetResult();
+        }
+        _environment.BrowserProcessExited += OnExited;
+        try
+        {
+            // 关闭发生在环境初始化期间时，还没有控制器可以关闭。
+            // 建一个空控制器再关闭，使该私有环境的浏览器进程完成正常退出。
+            using var host = new Control();
+            var controller = await _environment.CreateCoreWebView2ControllerAsync(host.Handle);
+            browserId = controller.CoreWebView2.BrowserProcessId;
+            controller.Close();
+            await exited.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        }
+        catch (Exception ex)
+        {
+            Log.Warn("等待无痕内核退出失败: " + ex.Message);
+        }
+        finally
+        {
+            _environment.BrowserProcessExited -= OnExited;
+            _environment = null;
+        }
     }
 
     // ---------------------------------------------------------------- 视图创建
@@ -642,7 +683,14 @@ public sealed class TabManager
     /// </summary>
     internal async Task<CoreWebView2> EnsureCoreAsync(WebView2 view, BrowserTab tab)
     {
-        await view.EnsureCoreWebView2Async(_environment);
+        CoreWebView2ControllerOptions options = null;
+        if (IsIncognito)
+        {
+            options = _environment.CreateCoreWebView2ControllerOptions();
+            options.IsInPrivateModeEnabled = true;
+        }
+        await view.EnsureCoreWebView2Async(_environment, options);
+        if (_shutdown || !tab.OwnsView(view)) return null;
         CoreWebView2 core = view.CoreWebView2;
         ApplyCoreSettings(core, tab);
         tab.BindCoreEvents(core);
@@ -655,7 +703,7 @@ public sealed class TabManager
         try
         {
             var s = core.Settings;
-            s.IsScriptEnabled = Settings.JavaScriptEnabled;
+            s.IsScriptEnabled = Settings.JavaScriptEnabled || UrlUtils.IsInternal(tab.Url);
             s.AreDefaultScriptDialogsEnabled = true;
             // 自动填充要用 WebMessage 和页面通信（页面把用户点选的账号、
             // 以及提交时的输入值发回来），所以必须打开
@@ -665,12 +713,12 @@ public sealed class TabManager
             s.IsStatusBarEnabled = false;
             s.IsZoomControlEnabled = true;
             s.IsBuiltInErrorPageEnabled = true;
-            s.IsPasswordAutosaveEnabled = true;
-            s.IsGeneralAutofillEnabled = true;
+            s.IsPasswordAutosaveEnabled = false;
+            s.IsGeneralAutofillEnabled = Settings.PasswordAutofill && !IsIncognito;
             s.IsPinchZoomEnabled = true;
             // 省内存：把「预渲染」与「后台挂起」策略交给 WebView2 自己管
             s.IsSwipeNavigationEnabled = false;
-            s.IsReputationCheckingRequired = false;
+            s.IsReputationCheckingRequired = true;
             s.IsNonClientRegionSupportEnabled = false;
 
             core.Profile.PreferredColorScheme = CoreWebView2PreferredColorScheme.Light;
@@ -707,7 +755,7 @@ public sealed class TabManager
     internal void NotifyNavigationCompleted(BrowserTab tab)
     {
         // 记录历史（首页不记）
-        if (!tab.IsHomePage)
+        if (!IsIncognito && !UrlUtils.IsInternal(tab.Url))
         {
             History.Record(tab.Url, tab.Title);
         }
@@ -757,18 +805,23 @@ public sealed class TabManager
 
         try
         {
-            var matches = Passwords.FindForUrl(tab.Url);
+            string source = tab.View.CoreWebView2.Source;
+            if (source == tab.CredentialSource && tab.CredentialPickToken != null) return;
+            var matches = Passwords.FindForUrl(source);
             var accounts = matches
                 .Select(e => (Id: e.Username + "\u0001" + e.Domain, Username: e.Username))
                 .ToList();
 
-            // 站点上没有已保存账号时 BuildScript 会返回空串，等价于不注入
-            string script = LoginAutofill.BuildScript(accounts);
+            string token = Guid.NewGuid().ToString("N");
+            string script = LoginAutofill.BuildScript(accounts, token);
             if (script.Length == 0)
             {
                 return;
             }
-            _ = tab.View.CoreWebView2.ExecuteScriptAsync(script);
+            tab.CredentialSource = source;
+            tab.CredentialPickToken = token;
+            _ = tab.View.CoreWebView2.ExecuteScriptAsync(
+                "if(window.location.href===" + JsQuote(source) + "){" + script + "}");
         }
         catch (Exception ex)
         {
@@ -779,25 +832,18 @@ public sealed class TabManager
     /// <summary>用户在页面的账号下拉里选了某一项。</summary>
     internal void NotifyCredentialPicked(BrowserTab tab, string accountId)
     {
-        if (tab?.View?.CoreWebView2 == null)
+        if (IsIncognito || !Settings.PasswordAutofill || tab?.View?.CoreWebView2 == null)
         {
             return;
         }
 
         try
         {
+            string source = tab.CredentialSource;
+            if (string.IsNullOrEmpty(source) || source != tab.View.CoreWebView2.Source) return;
             var matches = Passwords.FindForUrl(tab.Url);
-            PasswordEntry target = null;
-
-            if (!string.IsNullOrEmpty(accountId))
-            {
-                // id 由「用户名 \u0001 域名」拼成，用第一个命中项即可
-                string[] parts = accountId.Split('\u0001');
-                string wantUser = parts.Length > 0 ? parts[0] : "";
-                target = matches.FirstOrDefault(e =>
-                    string.Equals(e.Username, wantUser, StringComparison.Ordinal));
-            }
-            target ??= matches.FirstOrDefault();
+            PasswordEntry target = matches.FirstOrDefault(e =>
+                string.Equals(e.Username + "\u0001" + e.Domain, accountId, StringComparison.Ordinal));
 
             if (target == null)
             {
@@ -813,8 +859,9 @@ public sealed class TabManager
 
             // 明文只在这一瞬间存在于这条脚本字符串里，不写日志、不缓存
             string script =
+                "if(window.location.href===" + JsQuote(source) + "){" +
                 "window.__featherFillPassword&&window.__featherFillPassword(" +
-                JsQuote(target.Username) + "," + JsQuote(password) + ")";
+                JsQuote(target.Username) + "," + JsQuote(password) + ");}";
             _ = tab.View.CoreWebView2.ExecuteScriptAsync(script);
         }
         catch (Exception ex)
@@ -824,7 +871,7 @@ public sealed class TabManager
     }
 
     /// <summary>用户在登录表单里提交了，问一下要不要保存。</summary>
-    internal void NotifyCredentialSubmitted(BrowserTab tab, string username, string password)
+    internal void NotifyCredentialSubmitted(BrowserTab tab, string source, string username, string password)
     {
         if (tab == null || string.IsNullOrEmpty(password))
         {
@@ -836,14 +883,14 @@ public sealed class TabManager
         }
 
         // 已经有同站点同账号的记录了就不打扰
-        var existing = Passwords.FindForUrl(tab.Url);
+        var existing = Passwords.FindForUrl(source);
         if (existing.Any(e => string.Equals(e.Username, username ?? "",
                 StringComparison.Ordinal)))
         {
             return;
         }
 
-        SaveCredentialRequested?.Invoke(tab, username ?? "", password);
+        SaveCredentialRequested?.Invoke(tab, source, username ?? "", password);
     }
 
     /// <summary>把字符串转成 JS 字面量（用于把用户名/密码拼进脚本）。</summary>
@@ -890,10 +937,10 @@ public sealed class TabManager
         ContextMenuRequested?.Invoke(tab, e);
 
     /// <summary>内置管理页发来的消息（JSON）。宿主负责解析与响应。</summary>
-    public event Action<BrowserTab, string> InternalPageMessage;
+    public event Action<BrowserTab, string, string> InternalPageMessage;
 
-    internal void NotifyInternalPageMessage(BrowserTab tab, string json) =>
-        InternalPageMessage?.Invoke(tab, json);
+    internal void NotifyInternalPageMessage(BrowserTab tab, string json, string source) =>
+        InternalPageMessage?.Invoke(tab, json, source);
 
     /// <summary>
     /// 把数据推给内置管理页。
@@ -906,12 +953,14 @@ public sealed class TabManager
         try
         {
             WebView2 view = tab?.View;
-            if (view?.CoreWebView2 == null)
+            if (view?.CoreWebView2 == null || !InternalPages.Handles(view.CoreWebView2.Source))
             {
                 Log.Warn("推数据给内置页失败：视图还没就绪");
                 return;
             }
-            string script = $"window.featherUpdate({json});";
+            string source = view.CoreWebView2.Source;
+            string script = "if(window.location.href===" + JsQuote(source) + ")" +
+                $"{{window.featherUpdate({json});}}";
             Log.Info($"推数据给内置页: {json.Length} 字节 JSON");
             await view.CoreWebView2.ExecuteScriptAsync(script);
         }
@@ -997,10 +1046,17 @@ public sealed class TabManager
     /// </summary>
     internal void NotifyProcessFailed(BrowserTab tab, string kind, string reason)
     {
+        if (_shutdown || !_tabs.Contains(tab)) return;
         Log.Warn($"标签 {tab.Id} 的内核进程异常退出：{kind} / {reason}");
 
         bool wholeBrowser = kind.Contains("BrowserProcess", StringComparison.OrdinalIgnoreCase);
-        bool wasActive = tab == Active;
+        BrowserTab active = Active;
+
+        if (kind is not ("BrowserProcessExited" or "RenderProcessExited" or "FrameRenderProcessExited"))
+        {
+            ProcessFailed?.Invoke(tab, kind, reason);
+            return;
+        }
 
         if (wholeBrowser)
         {
@@ -1019,9 +1075,11 @@ public sealed class TabManager
         ProcessFailed?.Invoke(tab, kind, reason);
 
         // 当前标签重建，让用户感觉不到中断（其它冷标签在切过去时自然重建）
-        if (wasActive && _tabs.Contains(tab))
+        if (active != null && (wholeBrowser || active == tab))
         {
-            Activate(tab);
+            // 避免在内核回调内部销毁后立即重建 COM 控制器。
+            if (_uiInvoker.IsHandleCreated && !_uiInvoker.IsDisposed)
+                _uiInvoker.BeginInvoke(() => Activate(active));
         }
     }
 }

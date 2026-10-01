@@ -43,46 +43,34 @@ public static class UrlUtils
         }
 
         string text = input.Trim();
-        if (text.Contains(' '))
-        {
-            return false;
-        }
-
-        if (HasScheme(text) || text.StartsWith("feather://", StringComparison.OrdinalIgnoreCase))
+        if (HasScheme(text))
         {
             return true;
         }
 
-        if (text.StartsWith("localhost", StringComparison.OrdinalIgnoreCase))
-        {
-            return true;
-        }
+        if (text.Any(char.IsWhiteSpace)) return false;
 
         // 去掉可能的端口与路径，只看主机部分
         string hostPart = text;
-        int colon = hostPart.IndexOf(':');
-        if (colon > 0)
-        {
-            hostPart = hostPart[..colon];
-        }
-        int slash = hostPart.IndexOf('/');
-        if (slash > 0)
-        {
-            hostPart = hostPart[..slash];
-        }
+        int end = hostPart.IndexOfAny(new[] { '/', '?', '#' });
+        if (end >= 0) hostPart = hostPart[..end];
+        if (!Uri.TryCreate("http://" + hostPart, UriKind.Absolute, out var uri)) return false;
+        hostPart = uri.Host.Trim('[', ']');
+        if (hostPart.Equals("localhost", StringComparison.OrdinalIgnoreCase) ||
+            System.Net.IPAddress.TryParse(hostPart, out _)) return true;
 
         if (IsIpv4(hostPart))
         {
             return true;
         }
 
-        int dot = text.IndexOf('.');
+        int dot = hostPart.IndexOf('.');
         if (dot <= 0)
         {
             return false;
         }
 
-        string tld = text[(text.LastIndexOf('.') + 1)..];
+        string tld = hostPart[(hostPart.LastIndexOf('.') + 1)..];
         int cut = tld.Length;
         for (int i = 0; i < tld.Length; i++)
         {
@@ -111,6 +99,7 @@ public static class UrlUtils
     }
 
     private static bool HasScheme(string text) =>
+        text.StartsWith("feather://", StringComparison.OrdinalIgnoreCase) ||
         text.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
         text.StartsWith("https://", StringComparison.OrdinalIgnoreCase) ||
         text.StartsWith("file://", StringComparison.OrdinalIgnoreCase) ||
@@ -157,7 +146,10 @@ public static class UrlUtils
         string text = input.Trim();
         if (LooksLikeUrl(text))
         {
-            return HasScheme(text) ? text : "http://" + text;
+            if (HasScheme(text)) return text;
+            var uri = new Uri("http://" + text);
+            bool local = uri.IsLoopback || System.Net.IPAddress.TryParse(uri.Host.Trim('[', ']'), out _);
+            return (local ? "http://" : "https://") + text;
         }
 
         string template = string.IsNullOrEmpty(searchTemplate)
@@ -232,8 +224,7 @@ public static class UrlUtils
 
     /// <summary>
     /// 需要按「三段」处理的国家级后缀，例如 example.com.cn 的可注册域名是 com.cn 之前那段。
-    /// 不做完整的公共后缀表（那要几百 KB 数据），只覆盖常见的一部分：
-    /// 判断错了最多是自动填充范围偏宽或偏窄，不会造成安全问题。
+    /// 这里只用于展示和分组，自动填充权限使用完整 origin 匹配。
     /// </summary>
     private static readonly HashSet<string> TwoPartSuffixes = new(StringComparer.Ordinal)
     {

@@ -28,7 +28,7 @@ internal static class SelfTest
         "https://www.sogou.com/",
     };
 
-    public static async Task RunAsync(string outputPath)
+    public static Task RunAsync(string outputPath)
     {
         AppPaths.EnsureCreated();
         // 自检时不恢复上次会话，也不写脏设置
@@ -62,7 +62,7 @@ internal static class SelfTest
         {
             try
             {
-                tabs = new TabManager(BrowserContext.Shared, viewHost, parking, form,
+                tabs = new TabManager(new BrowserContext(settings), viewHost, parking, form,
                     incognito: false, temporaryDataFolder: null);
 
                 report.AppendLine("==== 轻羽浏览器 内存自检 ====");
@@ -244,6 +244,8 @@ internal static class SelfTest
         {
             Environment.ExitCode = 3;
         }
+        TabManager.Trace = null;
+        return Task.CompletedTask;
     }
 
     /// <summary>记录一次内存快照。</summary>
@@ -265,19 +267,12 @@ internal static class SelfTest
     private static async Task<bool> WaitForLoadAsync(BrowserTab tab, int timeoutMs)
     {
         var sw = Stopwatch.StartNew();
-        bool started = false;
 
         while (sw.ElapsedMilliseconds < timeoutMs)
         {
-            Application.DoEvents();
-
-            if (tab.IsLoading)
+            if (tab.LastNavigationSucceeded.HasValue)
             {
-                started = true;
-            }
-            else if (started || sw.ElapsedMilliseconds > 1200)
-            {
-                return true;
+                return tab.LastNavigationSucceeded.Value;
             }
 
             await Task.Delay(50);

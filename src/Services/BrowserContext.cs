@@ -28,9 +28,9 @@ public sealed class BrowserContext
 
     private readonly SemaphoreSlim _environmentGate = new(1, 1);
 
-    private BrowserContext()
+    internal BrowserContext(AppSettings settings = null)
     {
-        Settings = AppSettings.Load();
+        Settings = settings ?? AppSettings.Load();
         AdBlock = new AdBlocker();
         AdBlock.Enabled = Settings.AdBlockEnabled;
         History = new HistoryStore();

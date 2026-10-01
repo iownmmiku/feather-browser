@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Runtime;
 using System.Runtime.InteropServices;
 using FeatherBrowser.Services;
+using Microsoft.Web.WebView2.Core;
 
 namespace FeatherBrowser.Core;
 
@@ -9,11 +10,43 @@ namespace FeatherBrowser.Core;
 /// 内存监控与主动回收。
 ///
 /// <p>WebView2 的内存分布在多个子进程里（浏览器进程 + 每个渲染进程），
-/// 只看本进程的 WorkingSet 会严重低估。这里把所有同名的 WebView2 子进程都统计进来，
+/// 只看本进程的 WorkingSet 会严重低估。这里只统计本程序所用环境的 WebView2 子进程，
 /// 这样「标签回收到底省了多少」是可观测的，而不是靠感觉。
 /// </summary>
 public static class MemoryMonitor
 {
+    // 环境由窗口注册；共享环境引用计数，所有调用都在 WebView2 的 UI 线程。
+    private static readonly Dictionary<CoreWebView2Environment, int> Environments = new();
+
+    internal static void RegisterEnvironment(CoreWebView2Environment environment)
+    {
+        Environments.TryGetValue(environment, out int count);
+        Environments[environment] = count + 1;
+    }
+
+    internal static void UnregisterEnvironment(CoreWebView2Environment environment)
+    {
+        if (!Environments.TryGetValue(environment, out int count)) return;
+        if (count == 1) Environments.Remove(environment);
+        else Environments[environment] = count - 1;
+    }
+
+    internal static HashSet<int> GetBrowserProcessIds()
+    {
+        var ids = new HashSet<int>();
+        foreach (var environment in Environments.Keys)
+        {
+            try
+            {
+                foreach (var info in environment.GetProcessInfos()) ids.Add(info.ProcessId);
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("读取内核进程信息失败: " + ex.Message);
+            }
+        }
+        return ids;
+    }
     /// <summary>本进程私有字节（不含共享的渲染进程）。</summary>
     public static long PrivateBytes { get; private set; }
 
@@ -59,20 +92,17 @@ public static class MemoryMonitor
         {
             long total = 0;
             int count = 0;
-            foreach (var process in Process.GetProcessesByName("msedgewebview2"))
+            foreach (int id in GetBrowserProcessIds())
             {
                 try
                 {
+                    using var process = Process.GetProcessById(id);
                     total += process.WorkingSet64;
                     count++;
                 }
                 catch
                 {
                     // 进程可能刚好退出
-                }
-                finally
-                {
-                    process.Dispose();
                 }
             }
             WebViewWorkingSet = total;

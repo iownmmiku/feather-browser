@@ -39,6 +39,8 @@ internal sealed class MainForm : Form
     private readonly string _temporaryDataFolder;
     private readonly string _initialUrl;
     private readonly string _uiTest;
+    private Task _startupTask = Task.CompletedTask;
+    internal Task CleanupTask { get; private set; } = Task.CompletedTask;
 
     private TabManager _tabs;
 
@@ -69,6 +71,7 @@ internal sealed class MainForm : Form
     private int _progressValue;
     private bool _progressActive;
     private bool _addressDirty;
+    private bool _closing;
     private bool _findFirstMatch = true;
     private FormWindowState _lastWindowState;
     private string _statusText = "就绪";
@@ -86,10 +89,7 @@ internal sealed class MainForm : Form
         // 主题与倍率要在建任何控件之前定下来，否则字体与配色会不一致。
         Theme.Scale = Math.Clamp(_settings.UiScale, 1.0f, 1.6f);
         Theme.CaptureDpi(this);
-        if (themeOverride != null)
-        {
-            Theme.SetMode(ResolveThemeMode(themeOverride));
-        }
+        Theme.SetMode(ResolveThemeMode(themeOverride));
         Theme.WatchSystemTheme();
         Theme.SystemThemeChanged += OnSystemThemeChanged;
 
@@ -98,7 +98,7 @@ internal sealed class MainForm : Form
         _history = _context.History;
         _bookmarks = _context.Bookmarks;
         _passwords = _context.Passwords;
-        _downloads = _context.Downloads;
+        _downloads = incognito ? new DownloadStore(persist: false) : _context.Downloads;
 
         if (incognito)
         {
@@ -127,8 +127,10 @@ internal sealed class MainForm : Form
 
         Shown += async (_, _) =>
         {
+            if (_closing || IsDisposed) return;
             WindowChrome.ApplyDarkTitleBar(this, Theme.Dark);
-            await StartAsync();
+            _startupTask = StartAsync();
+            await _startupTask;
         };
         FormClosing += OnFormClosingHandler;
         FormClosed += OnFormClosedHandler;
@@ -574,7 +576,7 @@ internal sealed class MainForm : Form
     private async Task StartAsync()
     {
         _tabs = new TabManager(_context, _viewHost, _parking, this,
-            _incognito, _temporaryDataFolder);
+            _incognito, _temporaryDataFolder, _downloads);
         _tabs.TabsChanged += () => UpdateChrome();
         _tabs.NewWindowRequested += url =>
         {
@@ -584,21 +586,21 @@ internal sealed class MainForm : Form
             }
         };
         // 内置管理页（书签 / 下载 / 历史）发来的操作请求
-        _tabs.InternalPageMessage += (tab, json) =>
+        _tabs.InternalPageMessage += (tab, json, source) =>
         {
             if (IsHandleCreated)
             {
-                BeginInvoke(() => OnInternalPageMessage(tab, json));
+                BeginInvoke(() => OnInternalPageMessage(tab, json, source));
             }
         };
         // 网页右键：在内核菜单上补充桌面浏览器的常规项
         _tabs.ContextMenuRequested += OnContextMenuRequested;
         // 登录表单提交后询问是否保存
-        _tabs.SaveCredentialRequested += (tab, username, password) =>
+        _tabs.SaveCredentialRequested += (tab, source, username, password) =>
         {
             if (IsHandleCreated)
             {
-                BeginInvoke(() => PromptSaveCredential(tab, username, password));
+                BeginInvoke(() => PromptSaveCredential(source, username, password));
             }
         };
         // 内核进程被外部结束（例如在任务管理器里点了「结束任务」）：        // TabManager 已经把受影响的标签降为冷态并按需重建，这里只把情况告诉用户，
@@ -626,6 +628,7 @@ internal sealed class MainForm : Form
         }
         catch (Exception ex)
         {
+            if (_closing || IsDisposed) return;
             Log.Error("初始化 WebView2 失败", ex);
             MessageBox.Show(this,
                 "无法启动浏览器内核（WebView2 运行时）。\r\n\r\n" +
@@ -636,8 +639,9 @@ internal sealed class MainForm : Form
             return;
         }
 
-        RestoreTabs();
+        if (_closing || IsDisposed) return;
         ApplyPageTheme();
+        RestoreTabs();
 
         _memoryTimer = new System.Windows.Forms.Timer { Interval = 1500 };
         _memoryTimer.Tick += (_, _) => UpdateMemoryReadout();
@@ -1154,8 +1158,10 @@ internal sealed class MainForm : Form
     /// <para>页面只发「要做什么」，数据由宿主查好再推回，页面不做任何持久化。
     /// 这样页面即使被注入脚本也无法直接改数据。</para>
     /// </summary>
-    private void OnInternalPageMessage(BrowserTab tab, string json)
+    private void OnInternalPageMessage(BrowserTab tab, string json, string source)
     {
+        if (_closing || tab?.View?.CoreWebView2 == null || !InternalPages.Handles(source) ||
+            !string.Equals(tab.View.CoreWebView2.Source, source, StringComparison.Ordinal)) return;
         string kind;
         try
         {
@@ -1165,6 +1171,14 @@ internal sealed class MainForm : Form
                 return;
             }
             kind = k.GetString();
+            string pageKind = new Uri(source).AbsolutePath switch
+            {
+                "/bookmarks.html" => "bookmarks-",
+                "/history.html" => "history-",
+                "/downloads.html" => "downloads-",
+                _ => "",
+            };
+            if (kind == null || !kind.StartsWith(pageKind, StringComparison.Ordinal)) return;
         }
         catch (Exception ex)
         {
@@ -1239,7 +1253,7 @@ internal sealed class MainForm : Form
                 return;
             case "downloads-open":
             case "downloads-reveal":
-                RevealDownload(index, open: true);
+                RevealDownload(index, open: kind == "downloads-open");
                 return;
             case "downloads-folder":
                 RevealDownloadFolder();
@@ -1683,13 +1697,13 @@ internal sealed class MainForm : Form
             StartPosition = FormStartPosition.Manual,
             Location = new Point(Left + Theme.Sx(28), Top + Theme.Sy(28)),
         };
-        window.Show(this);
+        Program.Windows.OpenWindow(window);
     }
 
     private void OpenIncognitoWindow()
     {
         var form = new MainForm(null, incognito: true);
-        form.Show(this);
+        Program.Windows.OpenWindow(form);
     }
 
     private void CopyCurrentUrl()
@@ -1743,7 +1757,7 @@ internal sealed class MainForm : Form
     {
         _settings.LoadImages = !_settings.LoadImages;
         _settings.Save();
-        // 图片显示由注入的 CSS 控制，重新加载当前页即可立刻看到效果。
+        // 图片请求在下载前拦截，刷新当前页面以应用新设置。
         _tabs?.Active?.Reload();
         SetStatus(_settings.LoadImages ? "已开启图片加载" : "已关闭图片加载（重新加载页面生效）");
     }
@@ -1760,7 +1774,7 @@ internal sealed class MainForm : Form
                 {
                     if (tab.View?.CoreWebView2 != null)
                     {
-                        tab.View.CoreWebView2.Settings.IsScriptEnabled = _settings.JavaScriptEnabled;
+                        tab.View.CoreWebView2.Settings.IsScriptEnabled = _settings.JavaScriptEnabled || UrlUtils.IsInternal(tab.Url);
                     }
                 }
                 catch
@@ -1810,15 +1824,15 @@ internal sealed class MainForm : Form
     // ================================================================ 密码与导入
 
     /// <summary>登录表单提交后询问是否保存这条凭据。</summary>
-    private void PromptSaveCredential(BrowserTab tab, string username, string password)
+    private void PromptSaveCredential(string source, string username, string password)
     {
-        if (tab == null)
+        if (_closing || _incognito || !_settings.PasswordAutofill)
         {
             return;
         }
 
-        string origin = UrlUtils.OriginOf(tab.Url);
-        string site = UrlUtils.HostOf(tab.Url);
+        string origin = UrlUtils.OriginOf(source);
+        string site = UrlUtils.HostOf(source);
         string shownUser = string.IsNullOrEmpty(username) ? "（无用户名）" : username;
 
         DialogResult answer = MessageBox.Show(this,
@@ -1833,7 +1847,7 @@ internal sealed class MainForm : Form
             return;
         }
 
-        _passwords.Save(string.IsNullOrEmpty(origin) ? tab.Url : origin, username, password,
+        _passwords.Save(string.IsNullOrEmpty(origin) ? source : origin, username, password,
             source: "");
         SetStatus($"已保存 {site} 的登录信息");
     }
@@ -1957,7 +1971,7 @@ internal sealed class MainForm : Form
     private void ShowAbout()
     {
         MessageBox.Show(this,
-            "轻羽浏览器 1.0\r\n\r\n" +
+            $"轻羽浏览器 {Application.ProductVersion.Split('+')[0]}\r\n\r\n" +
             "Windows 原生浏览器，界面参考安卓端 Via 浏览器的极简形态。\r\n" +
             "内核：系统自带的 Microsoft Edge WebView2 运行时（不额外打包 Chromium）。\r\n\r\n" +
             "低内存做法：\r\n" +
@@ -2076,7 +2090,7 @@ internal sealed class MainForm : Form
         }
         else if (ctrl && (e.KeyCode == Keys.Tab || e.KeyCode == Keys.PageDown))
         {
-            CycleTab(1);
+            CycleTab(shift ? -1 : 1);
             e.Handled = true;
         }
         else if (ctrl && e.KeyCode == Keys.PageUp)
@@ -2102,7 +2116,17 @@ internal sealed class MainForm : Form
         }
         else if (ctrl && e.KeyCode == Keys.J)
         {
-            NextThemeMode();
+            OpenInternalPage(InternalPages.DownloadsUrl);
+            e.Handled = true;
+        }
+        else if (ctrl && e.KeyCode == Keys.H)
+        {
+            OpenInternalPage(InternalPages.HistoryUrl);
+            e.Handled = true;
+        }
+        else if (ctrl && shift && e.KeyCode == Keys.O)
+        {
+            OpenInternalPage(InternalPages.BookmarksUrl);
             e.Handled = true;
         }
         else if (e.KeyCode == Keys.F5)
@@ -2228,10 +2252,16 @@ internal sealed class MainForm : Form
 
     private void OnFormClosingHandler(object sender, FormClosingEventArgs e)
     {
+        if (e.Cancel || _closing) return;
+        _closing = true;
+        _memoryTimer?.Stop();
+        _progressTimer?.Stop();
         // 关掉正在运行的实例前先落盘设置，避免丢失
         try
         {
-            _settings.Save();
+            PersistSession();
+            _bookmarks.Flush();
+            _history.SaveNow();
         }
         catch (Exception ex)
         {
@@ -2246,55 +2276,42 @@ internal sealed class MainForm : Form
         if (_incognito && !string.IsNullOrEmpty(_temporaryDataFolder))
         {
             // 无痕窗口：删掉整个临时数据目录
-            TryDeleteFolder(_temporaryDataFolder);
+            CleanupTask = CleanupIncognitoAsync();
         }
     }
 
     /// <summary>
-    /// 窗口关闭后的收尾：解绑事件、清理内存，并在**最后一个窗口**关闭时退出进程。
-    ///
-    /// <para>多窗口下不能每个窗口一关就退出，所以这里数一遍还剩几个同类型窗口。
-    /// 最后一个窗口退出前把会话写盘（标签列表、窗口尺寸）。</para>
+    /// 窗口关闭后解绑主题事件；消息循环由 BrowserApplicationContext 管理。
     /// </summary>
     private void OnFormClosedHandler(object sender, FormClosedEventArgs e)
     {
         Theme.SystemThemeChanged -= OnSystemThemeChanged;
-
-        int remaining = 0;
-        foreach (Form form in Application.OpenForms)
-        {
-            if (form is MainForm)
-            {
-                remaining++;
-            }
-        }
-
-        if (remaining > 0)
-        {
-            return;
-        }
-
-        // 最后一个窗口：保存会话后退出
-        try
-        {
-            PersistSession();
-        }
-        catch (Exception ex)
-        {
-            Log.Warn("退出前保存会话失败: " + ex.Message);
-        }
-
-        MemoryMonitor.TrimWorkingSet();
-        Application.Exit();
     }
 
-    private static void TryDeleteFolder(string path)
+    private async Task CleanupIncognitoAsync()
     {
+        // 在初始化完成前关闭窗口时，环境仍可能晚到并创建临时目录。
+        await _startupTask;
+        if (_tabs != null) await _tabs.ReleasePrivateEnvironmentAsync();
+        await TryDeleteFolderAsync(_temporaryDataFolder);
+    }
+
+    private static async Task TryDeleteFolderAsync(string path)
+    {
+        string fullPath = Path.GetFullPath(path);
+        string tempRoot = Path.GetFullPath(Path.GetTempPath()).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        if (!fullPath.StartsWith(tempRoot, StringComparison.OrdinalIgnoreCase) ||
+            !Path.GetFileName(fullPath).StartsWith("FeatherIncognito_", StringComparison.Ordinal))
+        {
+            Log.Warn("无痕数据目录不在预期临时路径内，跳过删除");
+            return;
+        }
+        path = fullPath;
         if (!Directory.Exists(path))
         {
             return;
         }
-        for (int attempt = 0; attempt < 3; attempt++)
+        for (int attempt = 0; attempt < 20; attempt++)
         {
             try
             {
@@ -2304,7 +2321,7 @@ internal sealed class MainForm : Form
             catch
             {
                 // 内核进程可能还没完全退出，稍等再试
-                Thread.Sleep(250);
+                await Task.Delay(250);
             }
         }
         Log.Warn("无痕数据目录未能删除: " + path);
@@ -2313,7 +2330,7 @@ internal sealed class MainForm : Form
     /// <summary>把当前标签列表写回设置，供下次启动恢复。</summary>
     public void PersistSession()
     {
-        if (_tabs == null || _incognito)
+        if (_tabs == null || _tabs.Count == 0 || _incognito)
         {
             return;
         }
@@ -2350,7 +2367,8 @@ internal sealed class MainForm : Form
         {
             _memoryTimer?.Dispose();
             _progressTimer?.Dispose();
-            _adBlock.Enabled = false;
+            Theme.SystemThemeChanged -= OnSystemThemeChanged;
+            _tabs?.Shutdown();
         }
         base.Dispose(disposing);
     }
