@@ -49,6 +49,9 @@ public sealed class TabManager
     /// <summary>密码库。自动填充与「保存密码」提示都走它。</summary>
     public PasswordStore Passwords { get; }
 
+    /// <summary>某个标签的内核进程挂了（例如被任务管理器结束），请求宿主提示。</summary>
+    public event Action<BrowserTab, string, string> ProcessFailed;
+
     /// <summary>需要询问用户是否保存登录凭据时触发（账号, 密码）。</summary>
     public event Action<BrowserTab, string, string> SaveCredentialRequested;
 
@@ -740,4 +743,48 @@ public sealed class TabManager
     }
 
     internal void NotifyWindowCloseRequested(BrowserTab tab) => CloseTab(tab);
+
+    /// <summary>
+    /// 某个标签的内核进程异常退出。
+    ///
+    /// <p>不能静默忽略：这时标签持有的 WebView2 已经失效，用户看到的会是白屏或卡死。
+    /// 处理办法是把受影响的标签降为冷态（丢掉失效引用）再按需重建。
+    ///
+    /// <p>两种情况要区别对待：
+    /// <list type="bullet">
+    ///   <item><c>RenderProcessExited</c> —— 只有某个标签的渲染进程挂了，
+    ///         重建那一个即可；</item>
+    ///   <item><c>BrowserProcessExited</c> —— 整个内核进程没了，**所有**标签的视图都失效了。
+    ///         必须把全部标签降为冷态，否则其它标签会永远打不开。</item>
+    /// </list>
+    /// </summary>
+    internal void NotifyProcessFailed(BrowserTab tab, string kind, string reason)
+    {
+        Log.Warn($"标签 {tab.Id} 的内核进程异常退出：{kind} / {reason}");
+
+        bool wholeBrowser = kind.Contains("BrowserProcess", StringComparison.OrdinalIgnoreCase);
+        bool wasActive = tab == Active;
+
+        if (wholeBrowser)
+        {
+            // 内核整体退出：所有视图都失效，全部降为冷态
+            foreach (BrowserTab other in _tabs)
+            {
+                other.DestroyView();
+            }
+        }
+        else
+        {
+            tab.DestroyView();
+        }
+
+        TabsChanged?.Invoke();
+        ProcessFailed?.Invoke(tab, kind, reason);
+
+        // 当前标签重建，让用户感觉不到中断（其它冷标签在切过去时自然重建）
+        if (wasActive && _tabs.Contains(tab))
+        {
+            Activate(tab);
+        }
+    }
 }

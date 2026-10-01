@@ -113,6 +113,27 @@ WebView2 直接销毁，并调用 `MemoryMonitor.TrimWorkingSet()`
 关闭「加载图片」时，程序在 `DOMContentLoaded` 后注入一条 CSS 规则隐藏图片元素。
 图片仍然会被下载，但不再解码、不再占位图内存——对「内存优先」的场景比拦截请求更省内存。
 
+### 8. 内核进程被外部结束时自动恢复
+
+程序本质上是 WebView2 的宿主，所以「浏览器外壳」和「网页进程」在任务管理器里是分开的。
+如果只结束网页进程，外壳还在，就可能留下一个永远白屏的死界面。为此程序监听了内核的
+`ProcessFailed` 事件，并区分两种情况：
+
+| 被结束的进程 | 事件 | 处理 |
+|---|---|---|
+| 某个标签的渲染进程 | `RenderProcessExited` | 把该标签降为冷态并立即重建（等于自动重新加载） |
+| 整个浏览器内核进程 | `BrowserProcessExited` | **所有**标签的视图都已失效，全部降为冷态，当前标签立即重建 |
+
+实测（在任务管理器里手动结束进程）：
+
+```
+[WARN] 标签 dd4fdc2a 的内核进程异常退出：RenderProcessExited / Crashed
+[WARN] 标签 dd4fdc2a 的内核进程异常退出：BrowserProcessExited / Unexpected
+```
+
+两种情况浏览器都存活下来并自动恢复页面，状态栏会说明发生了什么。
+「内存与性能」面板里也放了「打开任务管理器」按钮，方便核对真实占用。
+
 ## 四、界面
 
 ### 圆角风格
@@ -362,7 +383,29 @@ $env:FEATHER_UITEST_DELAY='2000'   # 控制弹层延时（毫秒）
 
 # 内存自检
 FeatherBrowser.exe --selftest report.txt
+
+# 从夸克导入（也可在界面里做）
+FeatherBrowser.exe --import-quark=all;2000 --import-report=报告.txt
+
+# 把数据写到别的目录（隔离测试用，不动真实数据）
+FeatherBrowser.exe --data-dir=D:\tmp\feather-test
 ```
+
+### 换图标
+
+把 AI 生成的 PNG 放到 `assets\icon.png`（建议 1024×1024、透明背景、不要圆角遮罩），然后：
+
+```powershell
+.\tools\make-icon.ps1
+```
+
+它会：
+
+1. 用 `tools\iconmaker` 转出含 16/24/32/48/64/128/256 七个尺寸的 `assets\icon.ico`；
+2. 把 `.ico` 写进 csproj 的 `ApplicationIcon`（嵌进 exe，任务管理器与快捷方式用它）；
+3. 把 NSIS 的 `MUI_ICON` / `MUI_UNICON` 指向它（安装程序与卸载项用它）。
+
+没有图源时，程序会用代码画一枚兜底图标（蓝底白羽毛），保证窗口不会没图标。
 
 ## 十二、已知限制
 

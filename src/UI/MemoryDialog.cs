@@ -155,6 +155,18 @@ internal sealed class MemoryDialog : Form
             DialogResult = DialogResult.OK,
         };
         buttons.Controls.Add(close);
+
+        // 打开任务管理器：本程序的内存主要在内核子进程里，
+        // 想核对真实占用（以及单独结束某个进程看会发生什么）都从这里去。
+        var taskManager = new Button
+        {
+            Text = "打开任务管理器",
+            Width = Theme.Sx(170),
+            Height = Theme.Sy(38),
+            FlatStyle = FlatStyle.System,
+        };
+        taskManager.Click += (_, _) => OpenTaskManager();
+        buttons.Controls.Add(taskManager);
         root.Controls.Add(buttons, 0, 4);
 
         Controls.Add(root);
@@ -187,6 +199,25 @@ internal sealed class MemoryDialog : Form
         WindowChrome.ApplyDarkTitleBar(this, Theme.Dark);
     }
 
+    /// <summary>打开任务管理器。失败就提示，不抛异常。</summary>
+    private void OpenTaskManager()
+    {
+        try
+        {
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "taskmgr.exe",
+                UseShellExecute = true,
+            });
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this,
+                "打不开任务管理器：" + ex.Message + "\r\n\r\n可以按 Ctrl+Shift+Esc 手动打开。",
+                "内存与性能", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+    }
+
     private void UpdateLabels()
     {
         MemoryMonitor.Refresh();
@@ -215,7 +246,9 @@ internal sealed class MemoryDialog : Form
             "说明：真正占内存的是「渲染中」的标签，按当前数据平均每个约 " +
             MemoryMonitor.Mb(perTab) + "。\r\n" +
             "把上限调小，多余的标签会被休眠（销毁渲染进程），只保留网址，因此标签开到几十个，\r\n" +
-            "内存也不会线性增长。代价是切回休眠标签时需要重新加载一次页面。";
+            "内存也不会线性增长。代价是切回休眠标签时需要重新加载一次页面。\r\n" +
+            "提示：在任务管理器里结束本程序的任何一个 msedgewebview2 子进程，\r\n" +
+            "对应标签会自动重新加载，不会留下白屏的死状态。";
     }
 
     protected override void Dispose(bool disposing)

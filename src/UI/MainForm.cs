@@ -548,6 +548,21 @@ internal sealed class MainForm : Form
                 BeginInvoke(() => PromptSaveCredential(tab, username, password));
             }
         };
+        // 内核进程被外部结束（例如在任务管理器里点了「结束任务」）：
+        // TabManager 已经把受影响的标签降为冷态并按需重建，这里只把情况告诉用户，
+        // 避免出现「浏览器看着还在、网页却永远白屏」的死状态。
+        _tabs.ProcessFailed += (tab, kind, reason) =>
+        {
+            if (!IsHandleCreated)
+            {
+                return;
+            }
+            bool wholeBrowser = kind.Contains("BrowserProcess", StringComparison.OrdinalIgnoreCase);
+            string message = wholeBrowser
+                ? "浏览器内核进程被外部结束，已自动重建并重新加载页面"
+                : "网页进程被外部结束，已自动重新加载该标签";
+            BeginInvoke(() => SetStatus(message));
+        };
 
 
         _adBlock.Enabled = _settings.AdBlockEnabled;
