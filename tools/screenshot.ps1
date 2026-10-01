@@ -57,7 +57,9 @@ if ($mw -le 0 -or $mh -le 0) {
 
 $canvas = New-Object System.Drawing.Bitmap($mw, $mh)
 $cg = [System.Drawing.Graphics]::FromImage($canvas)
-$cg.Clear([System.Drawing.Color]::FromArgb(255, 70, 70, 80))
+# 画布底色用深色：主窗口截图万一没覆盖到边缘（圆角外、边框等），
+# 用浅灰会在深色界面旁边显出一条亮带，看起来像界面 bug。深色最不显眼。
+$cg.Clear([System.Drawing.Color]::FromArgb(255, 22, 23, 26))
 
 $main = New-Object System.Drawing.Bitmap($mw, $mh)
 $g1 = [System.Drawing.Graphics]::FromImage($main)

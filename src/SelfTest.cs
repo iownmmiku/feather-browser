@@ -62,8 +62,8 @@ internal static class SelfTest
         {
             try
             {
-                tabs = new TabManager(settings, adBlock, history, bookmarks, new PasswordStore(),
-                    viewHost, parking, form, incognito: false, temporaryDataFolder: null);
+                tabs = new TabManager(BrowserContext.Shared, viewHost, parking, form,
+                    incognito: false, temporaryDataFolder: null);
 
                 report.AppendLine("==== 轻羽浏览器 内存自检 ====");
                 report.AppendLine("时间: " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));

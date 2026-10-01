@@ -22,6 +22,7 @@ public sealed class TabManager
     private readonly Panel _viewHost;
     private readonly Panel _parking;
     private readonly Control _uiInvoker;
+    private readonly BrowserContext _context;
     private CoreWebView2Environment _environment;
     private bool _suspendedAll;
     private bool _activating;
@@ -48,6 +49,9 @@ public sealed class TabManager
 
     /// <summary>密码库。自动填充与「保存密码」提示都走它。</summary>
     public PasswordStore Passwords { get; }
+
+    /// <summary>某个标签的内核进程挂了（例如被任务管理器结束），请求宿主提示。</summary>
+    public event Action<BrowserTab, string, string> ProcessFailed;
 
     /// <summary>需要询问用户是否保存登录凭据时触发（账号, 密码）。</summary>
     public event Action<BrowserTab, string, string> SaveCredentialRequested;
@@ -93,15 +97,15 @@ public sealed class TabManager
         return sb.ToString();
     }
 
-    public TabManager(AppSettings settings, AdBlocker adBlocker, HistoryStore history,
-        BookmarkStore bookmarks, PasswordStore passwords, Panel viewHost, Panel parking,
+    public TabManager(BrowserContext context, Panel viewHost, Panel parking,
         Control uiInvoker, bool incognito, string temporaryDataFolder)
     {
-        Settings = settings;
-        AdBlock = adBlocker;
-        History = history;
-        Bookmarks = bookmarks;
-        Passwords = passwords;
+        _context = context;
+        Settings = context.Settings;
+        AdBlock = context.AdBlock;
+        History = context.History;
+        Bookmarks = context.Bookmarks;
+        Passwords = context.Passwords;
         _viewHost = viewHost;
         _parking = parking;
         _uiInvoker = uiInvoker;
@@ -110,15 +114,14 @@ public sealed class TabManager
     }
 
     /// <summary>
-    /// 初始化 WebView2 环境。整个进程只创建一次环境对象，所有标签共用，
-    /// 这是 WebView2 官方推荐的用法，也避免重复的浏览器进程。
+    /// 创建一个 WebView2 环境。
+    ///
+    /// <para>抽成静态方法是为了让多窗口共用：普通窗口都拿 <see cref="BrowserContext"/>
+    /// 里的同一个环境，只有无痕窗口才单独建一个（它需要独立的临时数据目录）。</para>
     /// </summary>
-    public async Task InitializeAsync()
+    public static async Task<CoreWebView2Environment> CreateEnvironmentAsync(
+        string userDataFolder, bool forceDarkPages)
     {
-        string userDataFolder = IsIncognito && !string.IsNullOrEmpty(TemporaryDataFolder)
-            ? TemporaryDataFolder
-            : AppPaths.WebViewDataFolder;
-
         var options = new CoreWebView2EnvironmentOptions
         {
             // 关掉一些用不到的后台特性，减少常驻线程与内存
@@ -129,18 +132,42 @@ public sealed class TabManager
         };
 
         // 深色主题：让内核把网页也按深色渲染（Chromium 的自动深色模式）。
-        // 这条是内核启动参数，只能在创建环境时给，改主题需要重开窗口。
-        if (PageTheme.ForceDark)
+        // 这是内核启动参数，只能在创建环境时给，运行中改主题需要重建环境。
+        if (forceDarkPages)
         {
             options.AdditionalBrowserArguments += " --enable-features=WebContentsForceDark";
         }
 
-        _environment = await CoreWebView2Environment.CreateAsync(
+        var environment = await CoreWebView2Environment.CreateAsync(
             browserExecutableFolder: null,
             userDataFolder: userDataFolder,
             options: options);
 
         Log.Info($"WebView2 环境就绪，用户数据目录: {userDataFolder}");
+        return environment;
+    }
+
+    /// <summary>
+    /// 取得本窗口要用的 WebView2 环境。
+    ///
+    /// <para>普通窗口从 <see cref="BrowserContext"/> 拿共用环境（缓存与 Cookie 不分裂）；
+    /// 无痕窗口用自己独立的环境与临时目录。</para>
+    /// </summary>
+    public async Task InitializeAsync()
+    {
+        if (_environment != null)
+        {
+            return;
+        }
+
+        if (IsIncognito && !string.IsNullOrEmpty(TemporaryDataFolder))
+        {
+            _environment = await CreateEnvironmentAsync(TemporaryDataFolder, PageTheme.ForceDark);
+        }
+        else
+        {
+            _environment = await _context.GetEnvironmentAsync(PageTheme.ForceDark);
+        }
     }
 
     /// <summary>
@@ -740,4 +767,48 @@ public sealed class TabManager
     }
 
     internal void NotifyWindowCloseRequested(BrowserTab tab) => CloseTab(tab);
+
+    /// <summary>
+    /// 某个标签的内核进程异常退出。
+    ///
+    /// <p>不能静默忽略：这时标签持有的 WebView2 已经失效，用户看到的会是白屏或卡死。
+    /// 处理办法是把受影响的标签降为冷态（丢掉失效引用）再按需重建。
+    ///
+    /// <p>两种情况要区别对待：
+    /// <list type="bullet">
+    ///   <item><c>RenderProcessExited</c> —— 只有某个标签的渲染进程挂了，
+    ///         重建那一个即可；</item>
+    ///   <item><c>BrowserProcessExited</c> —— 整个内核进程没了，**所有**标签的视图都失效了。
+    ///         必须把全部标签降为冷态，否则其它标签会永远打不开。</item>
+    /// </list>
+    /// </summary>
+    internal void NotifyProcessFailed(BrowserTab tab, string kind, string reason)
+    {
+        Log.Warn($"标签 {tab.Id} 的内核进程异常退出：{kind} / {reason}");
+
+        bool wholeBrowser = kind.Contains("BrowserProcess", StringComparison.OrdinalIgnoreCase);
+        bool wasActive = tab == Active;
+
+        if (wholeBrowser)
+        {
+            // 内核整体退出：所有视图都失效，全部降为冷态
+            foreach (BrowserTab other in _tabs)
+            {
+                other.DestroyView();
+            }
+        }
+        else
+        {
+            tab.DestroyView();
+        }
+
+        TabsChanged?.Invoke();
+        ProcessFailed?.Invoke(tab, kind, reason);
+
+        // 当前标签重建，让用户感觉不到中断（其它冷标签在切过去时自然重建）
+        if (wasActive && _tabs.Contains(tab))
+        {
+            Activate(tab);
+        }
+    }
 }

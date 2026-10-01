@@ -113,6 +113,47 @@ WebView2 直接销毁，并调用 `MemoryMonitor.TrimWorkingSet()`
 关闭「加载图片」时，程序在 `DOMContentLoaded` 后注入一条 CSS 规则隐藏图片元素。
 图片仍然会被下载，但不再解码、不再占位图内存——对「内存优先」的场景比拦截请求更省内存。
 
+### 8. 多窗口共用一套内核与数据
+
+`Ctrl+N` 开新窗口走的是**同进程多窗口**，而不是再启动一个 exe。差别很实在：
+
+| 做法 | WebView2 环境 | 磁盘缓存与 Cookie | 内存 |
+|---|---|---|---|
+| 再启动一个 exe | 每个进程建一个 | **分裂**（两套缓存、两套登录态） | 内核部分翻倍 |
+| 同进程多窗口（本程序） | 全进程一个 | 共用 | 只增加标签的开销 |
+
+实现上抽了一个 [`BrowserContext`](src/Services/BrowserContext.cs)，用 `Lazy<T>` 持有
+设置、书签、历史、密码库与广告拦截规则；WebView2 环境由第一个普通窗口创建、
+其余窗口复用（并发创建用信号量串行化）。**无痕窗口是唯一例外**：它有自己的临时数据目录，
+所以单独建一个环境，关闭时整个目录删除。
+
+多窗口也顺带解决了「最后一个窗口关闭才退出」的问题：窗口关闭时数一遍还剩几个 `MainForm`，
+只有最后一个才保存会话并调 `Application.Exit()`。
+
+> 多窗口让内存统计变得更好看：任务管理器里只有一个 `FeatherBrowser.exe`，
+> 内核子进程数随标签数变化而不是随窗口数翻倍。
+
+### 9. 内核进程被外部结束时自动恢复
+
+程序本质上是 WebView2 的宿主，所以「浏览器外壳」和「网页进程」在任务管理器里是分开的。
+如果只结束网页进程，外壳还在，就可能留下一个永远白屏的死界面。为此程序监听了内核的
+`ProcessFailed` 事件，并区分两种情况：
+
+| 被结束的进程 | 事件 | 处理 |
+|---|---|---|
+| 某个标签的渲染进程 | `RenderProcessExited` | 把该标签降为冷态并立即重建（等于自动重新加载） |
+| 整个浏览器内核进程 | `BrowserProcessExited` | **所有**标签的视图都已失效，全部降为冷态，当前标签立即重建 |
+
+实测（在任务管理器里手动结束进程）：
+
+```
+[WARN] 标签 dd4fdc2a 的内核进程异常退出：RenderProcessExited / Crashed
+[WARN] 标签 dd4fdc2a 的内核进程异常退出：BrowserProcessExited / Unexpected
+```
+
+两种情况浏览器都存活下来并自动恢复页面，状态栏会说明发生了什么。
+「内存与性能」面板里也放了「打开任务管理器」按钮，方便核对真实占用。
+
 ## 四、界面
 
 ### 圆角风格
@@ -162,6 +203,7 @@ WebView2 直接销毁，并调用 `MemoryMonitor.TrimWorkingSet()`
 **浏览**
 - 地址栏智能识别：输入 `github.com` 直接访问，输入「天气」送去搜索
 - 后退 / 前进 / 刷新 / 停止 / 首页
+- **多窗口**（`Ctrl+N`）：同进程内开新窗口，共用内核与数据（见下）
 - **标签侧边栏**（点标签按钮或 `Ctrl+Shift+T`）：列出全部标签，显示标题、域名与存活档位
   （绿点=渲染中 / 灰点=已休眠），可切换、单独关闭、新建、关闭全部；底部显示内存策略状态
 - 多标签：新建、关闭、切换、关闭全部、恢复上次会话（最多 20 个）
@@ -262,7 +304,8 @@ FeatherBrowser.exe --import-quark=passwords
 | 快捷键 | 功能 | 快捷键 | 功能 |
 |---|---|---|---|
 | `Ctrl+T` | 新建标签 | `Ctrl+W` | 关闭当前标签 |
-| `Ctrl+Shift+T` | 标签列表 | `Ctrl+Shift+N` | 无痕窗口 |
+| `Ctrl+N` | 新建窗口 | `Ctrl+Shift+N` | 无痕窗口 |
+| `Ctrl+Shift+T` | 标签侧边栏 | `Ctrl+Tab` | 下一个标签 |
 | `Ctrl+Tab` | 下一个标签 | `Ctrl+PageUp/Down` | 上/下一个标签 |
 | `Ctrl+L` | 聚焦地址栏 | `Ctrl+D` | 收藏当前页 |
 | `Ctrl+F` | 页内查找 | `F5` / `Ctrl+R` | 刷新 |
@@ -362,7 +405,29 @@ $env:FEATHER_UITEST_DELAY='2000'   # 控制弹层延时（毫秒）
 
 # 内存自检
 FeatherBrowser.exe --selftest report.txt
+
+# 从夸克导入（也可在界面里做）
+FeatherBrowser.exe --import-quark=all;2000 --import-report=报告.txt
+
+# 把数据写到别的目录（隔离测试用，不动真实数据）
+FeatherBrowser.exe --data-dir=D:\tmp\feather-test
 ```
+
+### 换图标
+
+把 AI 生成的 PNG 放到 `assets\icon.png`（建议 1024×1024、透明背景、不要圆角遮罩），然后：
+
+```powershell
+.\tools\make-icon.ps1
+```
+
+它会：
+
+1. 用 `tools\iconmaker` 转出含 16/24/32/48/64/128/256 七个尺寸的 `assets\icon.ico`；
+2. 把 `.ico` 写进 csproj 的 `ApplicationIcon`（嵌进 exe，任务管理器与快捷方式用它）；
+3. 把 NSIS 的 `MUI_ICON` / `MUI_UNICON` 指向它（安装程序与卸载项用它）。
+
+没有图源时，程序会用代码画一枚兜底图标（蓝底白羽毛），保证窗口不会没图标。
 
 ## 十二、已知限制
 

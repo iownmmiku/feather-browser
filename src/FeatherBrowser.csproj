@@ -10,6 +10,8 @@
     <RootNamespace>FeatherBrowser</RootNamespace>
     <AssemblyName>FeatherBrowser</AssemblyName>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- 图标由 tools\make-icon.ps1 从 assets\icon.png 生成 -->
+    <ApplicationIcon>..\assets\icon.ico</ApplicationIcon>
     <!-- 中文字符串较多，显式指定 UTF-8 源文件编码，避免乱码 -->
     <CodePage>65001</CodePage>
     <!-- 高 DPI 由 app.manifest 声明为 PerMonitorV2；WFAC010 是要求改用代码 API 的提示，

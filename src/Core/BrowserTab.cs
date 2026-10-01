@@ -577,6 +577,14 @@ public sealed class BrowserTab : IDisposable
 
         core.WindowCloseRequested += (_, _) => _manager.NotifyWindowCloseRequested(this);
 
+        // 内核进程意外消失时上报。
+        // 用户可能用任务管理器单独结束了某个渲染进程 —— 那时外壳还在，
+        // 但那个标签已经是死壳子。必须让宿主知道，才能自动恢复或给出提示，
+        // 而不是留一个「点了没反应也说不清哪坏了」的界面。
+        core.ProcessFailed += (_, e) =>
+            _manager.NotifyProcessFailed(this, e.ProcessFailedKind.ToString(),
+                e.Reason.ToString());
+
         // 登录表单自动填充：页面发回的消息在这里处理
         core.WebMessageReceived += (_, e) =>
         {
