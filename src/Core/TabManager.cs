@@ -127,7 +127,10 @@ public sealed class TabManager
             // 关掉一些用不到的后台特性，减少常驻线程与内存
             AdditionalBrowserArguments =
                 "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection " +
-                "--disable-background-timer-throttling=false",
+                "--disable-background-timer-throttling=false " +
+                // 让内核子进程继承本程序的身份，任务管理器里才会归到「轻羽浏览器」名下，
+                // 而不是显示成一堆 msedgewebview2
+                $"--app-user-model-id={AppIdentity.AppUserModelId}",
             Language = "zh-CN",
         };
 

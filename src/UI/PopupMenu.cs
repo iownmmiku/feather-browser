@@ -35,6 +35,9 @@ internal sealed class PopupMenu : Form
     private readonly Font _smallFont;
     private readonly int _rowHeight;
 
+    /// <summary>鼠标悬停的条目下标。自绘高亮靠它，不再依赖 ListBox 的选中态。</summary>
+    private int _hoverIndex = -1;
+
     public PopupMenu(IEnumerable<MenuEntry> items, Font uiFont, Font smallFont)
     {
         _items = items.ToList();
@@ -63,10 +66,29 @@ internal sealed class PopupMenu : Form
             BackColor = Theme.Background,
             ForeColor = Theme.Text,
             Font = _font,
+
+            // 关键：这里不要原生滚动条。
+            // 菜单高度是按条目数算好的（上限 22 行），正常不需要滚动；
+            // 而 Windows 的原生滚动条不受自绘控制，在深色主题下仍是白色，
+            // 会在面板右侧显出一条很显眼的白边。内容真的超长时靠滚轮滚动。
+            ScrollAlwaysVisible = false,
+            HorizontalScrollbar = false,
         };
         _list.DrawItem += OnDrawItem;
-        _list.Click += (_, _) => Invoke();
         _list.KeyDown += OnListKeyDown;
+        _list.MouseMove += OnListMouseMove;
+        _list.MouseLeave += (_, _) =>
+        {
+            if (_hoverIndex != -1)
+            {
+                _hoverIndex = -1;
+                _list.Invalidate();
+            }
+        };
+        // 用 MouseUp + IndexFromPoint 判定点中了哪一项。
+        // 之前用 Click + SelectedItem 有两个坑：点已选中的项不会再次触发，
+        // 点到分隔线或空白处则什么都不发生，看起来就像「点了没反应」。
+        _list.MouseUp += OnListMouseUp;
         Controls.Add(_list);
 
         foreach (MenuEntry item in _items)
@@ -122,14 +144,62 @@ internal sealed class PopupMenu : Form
         _list.Focus();
     }
 
+    /// <summary>点中哪一项就执行哪一项；分隔线与空白处不响应。</summary>
+    private void OnListMouseUp(object sender, MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Left)
+        {
+            return;
+        }
+        int index = _list.IndexFromPoint(e.Location);
+        if (index < 0 || index >= _list.Items.Count)
+        {
+            return;
+        }
+        if (_list.Items[index] is not MenuEntry entry || entry.Text == "-")
+        {
+            return;   // 分隔线不响应
+        }
+        _list.SelectedIndex = index;
+        Run(entry);
+    }
+
+    private void OnListMouseMove(object sender, MouseEventArgs e)
+    {
+        int index = _list.IndexFromPoint(e.Location);
+        if (index >= _list.Items.Count || index < 0)
+        {
+            index = -1;
+        }
+        // 分隔线不参与高亮
+        if (index >= 0 && _list.Items[index] is MenuEntry sep && sep.Text == "-")
+        {
+            index = -1;
+        }
+        if (index != _hoverIndex)
+        {
+            _hoverIndex = index;
+            _list.Invalidate();
+        }
+    }
+
     private void Invoke()
     {
         if (_list.SelectedItem is MenuEntry entry && entry.Action != null)
         {
-            Close();
-            // 延后执行，保证菜单已经关掉，动作里弹出的对话框不会被抢焦点
-            BeginInvoke(entry.Action);
+            Run(entry);
         }
+    }
+
+    /// <summary>关掉菜单再执行动作，避免动作里弹出的对话框被菜单抢焦点。</summary>
+    private void Run(MenuEntry entry)
+    {
+        if (entry?.Action == null)
+        {
+            return;
+        }
+        Close();
+        BeginInvoke(entry.Action);
     }
 
     private void OnListKeyDown(object sender, KeyEventArgs e)
@@ -210,7 +280,10 @@ internal sealed class PopupMenu : Form
             return;
         }
 
-        bool hover = (e.State & DrawItemState.Selected) == DrawItemState.Selected;
+        // 悬停：整行圆角底色，而不是直角高亮。
+        // 以鼠标位置为准（_hoverIndex），键盘操作时回退到 ListBox 的选中态。
+        bool hover = e.Index == _hoverIndex ||
+                     (e.State & DrawItemState.Selected) == DrawItemState.Selected;
 
         // 悬停：整行圆角底色，而不是直角高亮
         if (hover)

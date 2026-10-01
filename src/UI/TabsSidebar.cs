@@ -1,5 +1,6 @@
 using System.Drawing.Drawing2D;
 using FeatherBrowser.Core;
+using FeatherBrowser.Services;
 
 namespace FeatherBrowser.UI;
 
@@ -30,6 +31,9 @@ internal sealed class TabsSidebar : Control
     private int _scrollOffset;
     private int _contentHeight;
     private int _hoverRow = -1;
+
+    /// <summary>绘制次数，仅用于自检日志。</summary>
+    private int _paintCount;
     private Rectangle _newTabRect;
     private Rectangle _closeAllRect;
 
@@ -69,7 +73,38 @@ internal sealed class TabsSidebar : Control
 
         _contentHeight = HeaderHeight + _tabs.Count * Theme.Sy(RowHeight) + FooterHeight;
         ClampScroll();
+        RebuildLayout();
         Invalidate();
+    }
+
+    /// <summary>
+    /// 按当前位置算出所有命中区（标签行、新建按钮、关闭全部按钮）。
+    ///
+    /// <para>刻意在 <see cref="Update"/> 与尺寸变化时调用，**不在绘制里做**：
+    /// 命中区如果依赖绘制过程，绘制被跳过或延后时点击就全部落空，
+    /// 表现是「点了完全没反应」，而且很难查。</para>
+    /// </summary>
+    private void RebuildLayout()
+    {
+        _rows.Clear();
+
+        int rowHeight = RowHeightPx;
+        int y = HeaderHeight - _scrollOffset;
+        int pad = Theme.Sx(10);
+        for (int i = 0; i < _tabs.Count; i++)
+        {
+            _rows.Add(new RowHit(new Rectangle(pad, y, Math.Max(1, Width - pad * 2),
+                rowHeight - Theme.Sy(4)), i));
+            y += rowHeight;
+        }
+
+        // 标题栏右侧两个图标按钮
+        int buttonSize = Theme.Sy(30);
+        int buttonY = (HeaderHeight - buttonSize) / 2;
+        int buttonX = Width - Theme.Sx(14) - buttonSize;
+        _closeAllRect = new Rectangle(buttonX, buttonY, buttonSize, buttonSize);
+        buttonX -= buttonSize + Theme.Sx(4);
+        _newTabRect = new Rectangle(buttonX, buttonY, buttonSize, buttonSize);
     }
 
     /// <summary>侧边栏宽度（已按 DPI 与倍率换算）。</summary>
@@ -156,16 +191,9 @@ internal sealed class TabsSidebar : Control
             new Rectangle(pad, 0, Width - pad * 2, h), Theme.Text,
             TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
 
-        // 右上角两个图标按钮：新建标签 / 关闭全部
-        int buttonSize = Theme.Sy(30);
-        int y = (h - buttonSize) / 2;
-        int x = Width - pad - buttonSize;
-
-        _closeAllRect = new Rectangle(x, y, buttonSize, buttonSize);
+        // 右上角两个图标按钮：新建标签 / 关闭全部。
+        // 它们的位置由 RebuildLayout 统一算好，这里只画。
         DrawIconButton(g, _closeAllRect, "\u2715", _hoverRow == -2);
-
-        x -= buttonSize + Theme.Sx(4);
-        _newTabRect = new Rectangle(x, y, buttonSize, buttonSize);
         DrawIconButton(g, _newTabRect, "\uFF0B", _hoverRow == -1);
 
         using var pen = new Pen(Theme.Border);
@@ -186,25 +214,24 @@ internal sealed class TabsSidebar : Control
 
     private void DrawRows(Graphics g)
     {
-        _rows.Clear();
+        // 命中区已经在 RebuildLayout 里算好了，这里只负责画。
+        // 曾经这里既画行又顺手填 _rows，结果绘制被跳过时命中区为空，
+        // 所有点击都判为「未命中」，表现就是「点了完全没反应」。
+        int visibleTop = HeaderHeight;
+        int visibleBottom = Height - FooterHeight;
 
-        int rowHeight = RowHeightPx;
-        int y = HeaderHeight - _scrollOffset;
-        int pad = Theme.Sx(10);
-
-        for (int i = 0; i < _tabs.Count; i++)
+        foreach (RowHit row in _rows)
         {
-            Rectangle row = new(pad, y, Width - pad * 2, rowHeight - Theme.Sy(4));
-            _rows.Add(new RowHit(row, i));
-
-            // 超出可视区域的行不画（但命中区仍记录，滚回来就能点）
-            bool visible = row.Bottom > HeaderHeight && row.Top < Height - FooterHeight;
-            if (visible)
+            // 超出可视区域的行不画（命中区仍保留，滚回来就能点）
+            if (row.Bounds.Bottom <= visibleTop || row.Bounds.Top >= visibleBottom)
             {
-                DrawRow(g, row, _tabs[i], i == _activeIndex, _hoverRow == i);
+                continue;
             }
-
-            y += rowHeight;
+            if (row.Index < _tabs.Count)
+            {
+                DrawRow(g, row.Bounds, _tabs[row.Index],
+                    row.Index == _activeIndex, _hoverRow == row.Index);
+            }
         }
     }
 
@@ -345,6 +372,15 @@ internal sealed class TabsSidebar : Control
 
     protected override void OnMouseDown(MouseEventArgs e)
     {
+        // 诊断日志：只在设置 FEATHER_DEBUG_CLICK=1 时输出。
+        // 鼠标事件收不到、坐标算错、命中区为空 —— 这几种情况表现都是「点了没反应」，
+        // 只有日志能把它们区分开，所以这条留作开关而不是删掉。
+        bool debug = Environment.GetEnvironmentVariable("FEATHER_DEBUG_CLICK") == "1";
+        if (debug)
+        {
+            Log.Info($"侧边栏点击: ({e.X},{e.Y}) button={e.Button} 行数={_rows.Count}");
+        }
+
         if (e.Button != MouseButtons.Left)
         {
             return;
@@ -352,11 +388,13 @@ internal sealed class TabsSidebar : Control
 
         if (_newTabRect.Contains(e.Location))
         {
+            if (debug) { Log.Info("  -> 命中「新建标签」"); }
             NewTab?.Invoke();
             return;
         }
         if (_closeAllRect.Contains(e.Location))
         {
+            if (debug) { Log.Info("  -> 命中「关闭全部」"); }
             CloseAll?.Invoke();
             return;
         }
@@ -370,21 +408,50 @@ internal sealed class TabsSidebar : Control
             // 点在行右侧的关闭区域就关标签，否则切过去
             if (e.X > row.Bounds.Right - Theme.Sx(32))
             {
+                if (debug) { Log.Info($"  -> 命中第 {row.Index} 行的关闭按钮"); }
                 CloseTab?.Invoke(row.Index);
             }
             else
             {
+                if (debug) { Log.Info($"  -> 命中第 {row.Index} 行，切过去"); }
                 ActivateTab?.Invoke(row.Index);
             }
             return;
         }
 
+        if (debug) { Log.Info("  -> 未命中任何区域"); }
         base.OnMouseDown(e);
     }
+
+    /// <summary>
+    /// 供自检查用：按坐标走一遍点击判定，把结果以文字返回。
+    /// 这样不必真的移动鼠标就能验证命中区算得对不对。
+    /// </summary>
+    public string DescribeHit(Point p)
+    {
+        if (_newTabRect.Contains(p)) return $"({p.X},{p.Y}) -> 新建标签按钮";
+        if (_closeAllRect.Contains(p)) return $"({p.X},{p.Y}) -> 关闭全部按钮";
+        foreach (RowHit row in _rows)
+        {
+            if (row.Bounds.Contains(p))
+            {
+                bool onClose = p.X > row.Bounds.Right - Theme.Sx(32);
+                return $"({p.X},{p.Y}) -> 第 {row.Index} 行{(onClose ? " 的关闭按钮" : "")} {row.Bounds}";
+            }
+        }
+        return $"({p.X},{p.Y}) -> 未命中（行数={_rows.Count} 内容高={_contentHeight}）";
+    }
+
+    /// <summary>供自检查用：鼠标事件是否真的会送到这个控件上（Bounds 是否有面积）。</summary>
+    public string DescribeState() =>
+        $"Bounds={Bounds} Visible={Visible} Enabled={Enabled} " +
+        $"行数={_rows.Count} 内容高={_contentHeight} 视口高={ViewportHeight}";
 
     protected override void OnSizeChanged(EventArgs e)
     {
         ClampScroll();
+        // 尺寸变了命中区也要跟着变，否则点击位置会整体错位
+        RebuildLayout();
         base.OnSizeChanged(e);
     }
 

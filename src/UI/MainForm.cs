@@ -658,6 +658,26 @@ internal sealed class MainForm : Form
                 {
                     case "tabs":
                         ShowTabList();
+                        // 自检：把侧边栏状态与若干坐标的命中判定写进日志。
+                        // 不移动鼠标就能验证命中区算得对不对。
+                        BeginInvoke(() =>
+                        {
+                            Log.Info("侧边栏自检: " + _sidebar.DescribeState());
+                            int w = _sidebar.Width;
+                            int h = _sidebar.Height;
+                            foreach (Point probe in new[]
+                                     {
+                                         new Point(w - Theme.Sx(30), Theme.Sy(28)),
+                                         new Point(w - Theme.Sx(70), Theme.Sy(28)),
+                                         new Point(w / 2, Theme.Sy(86)),
+                                         new Point(w / 2, Theme.Sy(140)),
+                                         new Point(w - Theme.Sx(20), Theme.Sy(140)),
+                                         new Point(w / 2, h - Theme.Sy(20)),
+                                     })
+                            {
+                                Log.Info("  命中判定 " + _sidebar.DescribeHit(probe));
+                            }
+                        });
                         break;
                     case "menu":
                         ShowMenu();

@@ -58,6 +58,10 @@ internal static class Program
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
 
+        // 登记程序身份：让任务管理器/任务栏显示「轻羽浏览器」，
+        // 而不是把网页子进程显示成 msedgewebview2 或「WebView2」。
+        AppIdentity.Initialize(null);
+
         Application.ThreadException += (_, e) =>
             Log.Error("界面线程未处理异常", e.Exception);
         AppDomain.CurrentDomain.UnhandledException += (_, e) =>
