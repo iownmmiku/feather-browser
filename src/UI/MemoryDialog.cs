@@ -232,15 +232,15 @@ internal sealed class MemoryDialog : Form
         _appLabel.Text = $"本程序：工作集 {MemoryMonitor.Mb(MemoryMonitor.WorkingSet)}" +
                          $"（私有 {MemoryMonitor.Mb(MemoryMonitor.PrivateBytes)}）";
 
-        _kernelLabel.Text = $"Edge 内核：{MemoryMonitor.WebViewProcessCount} 个进程，" +
-                            $"合计 {MemoryMonitor.Mb(MemoryMonitor.WebViewWorkingSet)}";
+        _kernelLabel.Text = $"Chromium 内核：{MemoryMonitor.KernelProcessCount} 个进程，" +
+                            $"合计 {MemoryMonitor.Mb(MemoryMonitor.KernelWorkingSet)}";
 
         _tabLabel.Text = $"标签：共 {_tabs.Count} 个 —— 渲染中 {_tabs.LiveCount}" +
                          $"，已挂起 {_tabs.SuspendedCount}，已休眠 {_tabs.ColdCount}" +
                          $"，历史上共创建过 {_tabs.TotalCreated} 个内核视图";
 
         long perTab = _tabs.LiveCount > 0
-            ? MemoryMonitor.WebViewWorkingSet / _tabs.LiveCount
+            ? MemoryMonitor.KernelWorkingSet / _tabs.LiveCount
             : 0;
         _verdictLabel.Text =
             "说明：真正占内存的是「渲染中」的标签，按当前数据平均每个约 " +

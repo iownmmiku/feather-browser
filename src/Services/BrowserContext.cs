@@ -1,5 +1,5 @@
 using FeatherBrowser.Core;
-using Microsoft.Web.WebView2.Core;
+
 
 namespace FeatherBrowser.Services;
 
@@ -8,9 +8,9 @@ namespace FeatherBrowser.Services;
 ///
 /// <para>为什么必须共享：
 /// <list type="bullet">
-///   <item><b>WebView2 环境</b> —— 环境对应一套浏览器进程与磁盘缓存。
+///   <item><b>CEF 环境</b> —— 环境对应一套浏览器进程与磁盘缓存。
 ///         每个窗口建一个环境，缓存与 Cookie 会分裂、内核进程也会翻倍。
-///         官方推荐整个进程只建一次。无痕窗口是唯一例外，它有自己的临时目录。</item>
+///         官方推荐整个进程只建一次。无痕窗口使用独立的内存 Cookie 与缓存。</item>
 ///   <item><b>数据存储</b> —— 设置、书签、历史、密码库在一个进程里必须只有一份，
 ///         否则两个窗口各自持有副本，互相覆盖对方写入的内容。</item>
 ///   <item><b>广告拦截规则</b> —— 几百条域名，没必要每个窗口加载一遍。</item>
@@ -52,14 +52,14 @@ public sealed class BrowserContext
     /// <summary>下载记录。多个窗口共用一份。</summary>
     public DownloadStore Downloads { get; }
 
-    /// <summary>普通窗口共用的 WebView2 环境；第一个窗口打开时创建。</summary>
-    private CoreWebView2Environment _sharedEnvironment;
+    /// <summary>普通窗口共用的 CEF 环境；第一个窗口打开时创建。</summary>
+    private BrowserProfile _sharedEnvironment;
 
     /// <summary>
     /// 取共用环境，没有就创建。并发调用会被串行化，不会建出两个环境。
     /// </summary>
-    /// <param name="forceDarkPages">是否让内核把网页按深色渲染（内核启动参数，创建后不可改）。</param>
-    public async Task<CoreWebView2Environment> GetEnvironmentAsync(bool forceDarkPages)
+    /// <param name="forceDarkPages">网页配色由每个视图动态同步。</param>
+    internal async Task<BrowserProfile> GetEnvironmentAsync(bool forceDarkPages)
     {
         if (_sharedEnvironment != null)
         {
@@ -72,8 +72,8 @@ public sealed class BrowserContext
             if (_sharedEnvironment == null)
             {
                 _sharedEnvironment = await TabManager.CreateEnvironmentAsync(
-                    AppPaths.WebViewDataFolder, forceDarkPages).ConfigureAwait(true);
-                Log.Info("共用 WebView2 环境已创建，所有普通窗口共用");
+                    Path.Combine(AppPaths.BrowserDataFolder, "Default"), forceDarkPages).ConfigureAwait(true);
+                Log.Info("共用 CEF 环境已创建，所有普通窗口共用");
             }
             return _sharedEnvironment;
         }
@@ -84,5 +84,7 @@ public sealed class BrowserContext
     }
 
     /// <summary>环境是否已经建好（没建好的话，新窗口需要等待）。</summary>
+    internal void DisposeEnvironment() { _sharedEnvironment?.Dispose(); _sharedEnvironment = null; }
+
     public bool HasEnvironment => _sharedEnvironment != null;
 }

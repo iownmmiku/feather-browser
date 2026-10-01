@@ -14,10 +14,13 @@ internal static class Program
 {
     private static readonly List<string> Results = new();
     private static int _failures;
+    private static bool _completed;
 
     [STAThread]
-    private static int Main()
+    private static int Main(string[] args)
     {
+        int subprocessExit = CefSharp.BrowserSubprocess.SelfHost.Main(args);
+        if (subprocessExit >= 0) return subprocessExit;
         string root = Path.Combine(Path.GetTempPath(), "FeatherRegression_" + Guid.NewGuid().ToString("N"));
         AppPaths.OverrideRoot(root);
         AppPaths.EnsureCreated();
@@ -34,11 +37,12 @@ internal static class Program
         };
         form.Shown += async (_, _) =>
         {
-            try { await RunAsync(form); }
+            try { await RunAsync(form); _completed = true; }
             catch (Exception ex) { Fail("Runner", ex); }
             finally { form.Close(); }
         };
-        Application.Run(form);
+        try { Application.Run(form); } finally { BrowserRuntime.Shutdown(); }
+        if (!_completed) Fail("Runner", new InvalidOperationException("The message loop ended before the checks completed"));
         string report = string.Join(Environment.NewLine, Results) +
             $"{Environment.NewLine}Failures: {_failures}{Environment.NewLine}Data: {root}";
         File.WriteAllText(Path.Combine(root, "regression-report.txt"), report);
@@ -62,6 +66,21 @@ internal static class Program
             Require(!InternalPages.Handles("https://feather.local:444/bookmarks.html"));
             Require(!InternalPages.Handles("https://feather.local/unknown.html"));
             return Task.CompletedTask;
+        });
+
+        await Check("A second launch forwards its URL to the existing host through the user-only pipe", async () =>
+        {
+            using var owner = new SingleInstance(Path.Combine(AppPaths.Root, "instance-probe"));
+            Require(owner.IsOwner);
+            var received = new TaskCompletionSource<string>();
+            owner.Listen(url => received.TrySetResult(url));
+            await Task.Run(async () =>
+            {
+                using var second = new SingleInstance(Path.Combine(AppPaths.Root, "instance-probe") + Path.DirectorySeparatorChar);
+                Require(!second.IsOwner);
+                await second.ForwardAsync("https://example.com/second-launch");
+            });
+            Equal("https://example.com/second-launch", await received.Task.WaitAsync(TimeSpan.FromSeconds(10)));
         });
 
         await Check("Passwords stay within the saved scheme, host and port", () =>
@@ -118,7 +137,7 @@ internal static class Program
                 try
                 {
                     tabs.Settings.Engine.Template = server.Url + "search?q=%s";
-                    await tab.View.CoreWebView2.ExecuteScriptAsync("location.href='feather://search?q=hello%20world'");
+                    await tab.View.Engine.ExecuteScriptAsync("location.href='feather://search?q=hello%20world'");
                     await Until(() => tab.Url.StartsWith(server.Url + "search") && tab.Progress == 100 && !tab.IsLoading);
                     Equal(server.Url + "search?q=hello%20world", tab.Url);
                 }
@@ -167,7 +186,7 @@ internal static class Program
                 tabs.Activate(first);
                 await pending;
                 Equal(TabLife.Live, first.Life);
-                Require(!first.View.CoreWebView2.IsSuspended);
+                Require(!first.View.Engine.IsSuspended);
                 // Parent form is deliberately offscreen, so visibility is checked on the controller state above.
                 Equal(first, tabs.Active);
             });
@@ -194,7 +213,7 @@ internal static class Program
                 {
                     var tab = tabs.NewTab(server.Url + "bridge");
                     await Loaded(tab);
-                    await tab.View.CoreWebView2.ExecuteScriptAsync("chrome.webview.postMessage(JSON.stringify({feather:'bookmarks-clear'}))");
+                    await tab.View.Engine.ExecuteScriptAsync("CefSharp.PostMessage(JSON.stringify({feather:'bookmarks-clear'}))");
                     await Task.Delay(200);
                     Equal(0, messages);
                     tab.NavigateTo(InternalPages.BookmarksUrl);
@@ -211,11 +230,11 @@ internal static class Program
                 {
                     var tab = tabs.NewTab(server.Url + "scripts");
                     await Loaded(tab);
-                    Require(!tab.View.CoreWebView2.Settings.IsScriptEnabled);
-                    Equal("true", await tab.View.CoreWebView2.ExecuteScriptAsync("typeof PAGE_SCRIPT_RAN === 'undefined'"));
+                    Require(!tab.View.Engine.Settings.IsScriptEnabled);
+                    Equal("true", await tab.View.Engine.ExecuteScriptAsync("typeof PAGE_SCRIPT_RAN === 'undefined'"));
                     tab.NavigateTo(InternalPages.BookmarksUrl);
                     await Loaded(tab);
-                    Require(tab.View.CoreWebView2.Settings.IsScriptEnabled);
+                    Require(tab.View.Engine.Settings.IsScriptEnabled);
                     await UntilScript(tab, "typeof window.featherUpdate === 'function'");
                 }
                 finally { tabs.Settings.JavaScriptEnabled = true; }
@@ -233,7 +252,7 @@ internal static class Program
                     var tab = tabs.NewTab(server.Url + "login");
                     await Loaded(tab);
                     await UntilScript(tab, "typeof window.__featherFillPassword === 'function'");
-                    await tab.View.CoreWebView2.ExecuteScriptAsync("document.querySelector('input[type=text]').value='test-user';document.querySelector('input[type=password]').value='test-password';document.querySelector('form').dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));");
+                    await tab.View.Engine.ExecuteScriptAsync("document.querySelector('input[type=text]').value='test-user';document.querySelector('input[type=password]').value='test-password';document.querySelector('form').dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));");
                     await Until(() => receivedPassword != null);
                     Equal(server.Url + "login", receivedSource);
                     Equal("test-password", receivedPassword);
@@ -249,13 +268,13 @@ internal static class Program
                 await UntilScript(tab, "typeof window.__featherFillPassword === 'function'");
                 string accountId = "test-user\u0001" + UrlUtils.RegistrableDomain(server.Url);
                 string message = "feather:" + JsonSerializer.Serialize(new { type = "pick", id = accountId, token = "forged" });
-                await tab.View.CoreWebView2.ExecuteScriptAsync("chrome.webview.postMessage(" + JsonSerializer.Serialize(message) + ")");
+                await tab.View.Engine.ExecuteScriptAsync("CefSharp.PostMessage(" + JsonSerializer.Serialize(message) + ")");
                 await Task.Delay(200);
-                Equal("\"\"", await tab.View.CoreWebView2.ExecuteScriptAsync("document.querySelector('input[type=password]').value"));
+                Equal("\"\"", await tab.View.Engine.ExecuteScriptAsync("document.querySelector('input[type=password]').value"));
                 tab.NavigateTo(server.Url + "login?next-document");
                 tabs.NotifyCredentialPicked(tab, accountId);
                 await Loaded(tab);
-                Equal("\"\"", await tab.View.CoreWebView2.ExecuteScriptAsync("document.querySelector('input[type=password]').value"));
+                Equal("\"\"", await tab.View.Engine.ExecuteScriptAsync("document.querySelector('input[type=password]').value"));
                 tabs.Passwords.Clear();
             });
 
@@ -284,6 +303,163 @@ internal static class Program
                 Equal(original, File.Exists(file) ? File.ReadAllText(file) : null);
             });
         }, incognito: true);
+
+        await Check("The webpage stays below the chrome when resized and UI scale changes", async () =>
+        {
+            await WithWindow(server.Url + "layout", window =>
+            {
+                float original = Theme.Scale;
+                try
+                {
+                    foreach (float scale in new[] { 1f, 1.15f, 1.3f, 1.5f })
+                    {
+                        Theme.Scale = scale;
+                        Theme.RefreshFonts();
+                        Call(window, "ApplyScaledMetrics");
+                        foreach (Size size in new[] { new Size(1100, 740), new Size(1400, 900) })
+                        {
+                            window.ClientSize = size;
+                            AssertBrowserLayout(window);
+                            Call(window, "ShowFindBar");
+                            AssertBrowserLayout(window);
+                            Call(window, "HideFindBar");
+                        }
+                    }
+                }
+                finally { Theme.Scale = original; Theme.RefreshFonts(); }
+                return Task.CompletedTask;
+            });
+        });
+
+        await Check("Toggling the sidebar keeps the webpage visible and never changes dock order", async () =>
+        {
+            await WithWindow(server.Url + "layout", async window =>
+            {
+                var content = Field<Panel>(window, "_contentHost");
+                var host = Field<Panel>(window, "_viewHost");
+                var sidebar = Field<TabsSidebar>(window, "_sidebar");
+                int originalWidth = host.Width;
+                int originalOrder = content.Controls.GetChildIndex(host);
+                var active = GetTabs(window)!.Active;
+                int webWidth = int.Parse(await active.View.Engine.ExecuteScriptAsync("innerWidth"));
+                for (int i = 0; i < 12; i++)
+                {
+                    Call(window, "ToggleSidebar");
+                    Require(sidebar.Visible && host.Visible && active.View.Visible);
+                    Equal(sidebar.Left, host.Right);
+                    Require(host.Width > 0 && host.Width < originalWidth);
+                    AssertBrowserLayout(window);
+                    Equal(originalOrder, content.Controls.GetChildIndex(host));
+                    Call(window, "ToggleSidebar");
+                    Equal(originalWidth, host.Width);
+                    AssertBrowserLayout(window);
+                }
+                Call(window, "ToggleSidebar");
+                await UntilScript(active, $"innerWidth > 0 && innerWidth < {webWidth}");
+            });
+        });
+
+        await Check("Scrolled sidebar rows select and close the visible tab and exclude its header and footer", async () =>
+        {
+            await WithWindow(server.Url + "layout", async window =>
+            {
+                var tabs = GetTabs(window)!;
+                for (int i = 0; i < 29; i++) tabs.NewTab(server.Url + "cold-" + i, activate: false);
+                Call(window, "ToggleSidebar");
+                var sidebar = Field<TabsSidebar>(window, "_sidebar");
+                Point rowPoint = new(Theme.Sx(40), Theme.Sy(56) + Theme.Sy(20));
+                Require(sidebar.DescribeHit(rowPoint).Contains("第 0 行"));
+                Call(sidebar, "OnMouseWheel", new MouseEventArgs(MouseButtons.None, 0, rowPoint.X, rowPoint.Y, -120));
+                Require(sidebar.DescribeHit(rowPoint).Contains("第 3 行"), sidebar.DescribeHit(rowPoint));
+                Call(sidebar, "OnMouseDown", new MouseEventArgs(MouseButtons.Left, 1, rowPoint.X, rowPoint.Y, 0));
+                Equal(3, tabs.ActiveIndex);
+                await Loaded(tabs.Active);
+                var selected = tabs.Active;
+                Call(sidebar, "OnMouseDown", new MouseEventArgs(MouseButtons.Left, 1,
+                    sidebar.Width - Theme.Sx(25), rowPoint.Y, 0));
+                Equal(29, tabs.Count);
+                Require(!tabs.Tabs.Contains(selected));
+                Require(sidebar.DescribeHit(new Point(Theme.Sx(25), Theme.Sy(20))).Contains("未命中"));
+                int footerClicks = 0;
+                sidebar.ShowMemoryDialog = () => footerClicks++;
+                Call(sidebar, "OnMouseDown", new MouseEventArgs(MouseButtons.Left, 1,
+                    Theme.Sx(25), sidebar.Height - Theme.Sy(15), 0));
+                Equal(1, footerClicks);
+                Equal(29, tabs.Count);
+                Call(sidebar, "OnKeyDown", new KeyEventArgs(Keys.End));
+                Equal(tabs.Count - 1, tabs.ActiveIndex);
+                await Loaded(tabs.Active);
+                string lastRow = sidebar.DescribeHit(new Point(Theme.Sx(40), sidebar.Height - Theme.Sy(64) - Theme.Sy(20)));
+                Require(lastRow.Contains($"第 {tabs.Count - 1} 行"), lastRow);
+            });
+        });
+
+        await Check("Menu mouse actions run on the browser after the menu closes", async () =>
+        {
+            await WithWindow(server.Url + "layout", async window =>
+            {
+                Call(window, "ShowMenu");
+                var menu = window.OwnedForms.OfType<PopupMenu>().Single();
+                Rectangle workingArea = Screen.FromControl(window).WorkingArea;
+                Require(workingArea.Contains(menu.Bounds), "Main menu extends outside its screen");
+                menu.Location = window.Location;
+                var list = Field<ListBox>(menu, "_list");
+                int index = list.Items.Cast<MenuEntry>().ToList().FindIndex(item => item.Text == "历史记录");
+                list.SelectedIndex = index;
+                Rectangle itemRect = list.GetItemRectangle(index);
+                Call(menu, "OnListMouseUp", list, new MouseEventArgs(MouseButtons.Left, 1,
+                    itemRect.Left + 10, itemRect.Top + itemRect.Height / 2, 0));
+                Require(menu.IsDisposed);
+                await Until(() => GetTabs(window)!.Active.Url == InternalPages.HistoryUrl);
+                await Loaded(GetTabs(window)!.Active);
+                AssertBrowserLayout(window);
+            });
+        });
+
+        await Check("Tab context menus remain alive after showing and execute keyboard actions", async () =>
+        {
+            await WithWindow(server.Url + "layout", async window =>
+            {
+                int before = GetTabs(window)!.Count;
+                Call(window, "ShowTabContextMenu", 0, window.PointToScreen(new Point(40, 80)));
+                var menu = window.OwnedForms.OfType<PopupMenu>().Single();
+                Require(!menu.IsDisposed && menu.Visible);
+                menu.Location = window.Location;
+                var list = Field<ListBox>(menu, "_list");
+                list.SelectedIndex = list.Items.Cast<MenuEntry>().ToList().FindIndex(item => item.Text == "新建标签页");
+                Call(menu, "OnListKeyDown", list, new KeyEventArgs(Keys.Enter));
+                await Until(() => GetTabs(window)!.Count == before + 1);
+                await Loaded(GetTabs(window)!.Active);
+                Require(GetTabs(window)!.Active.IsHomePage);
+            });
+        });
+
+        await Check("Long menus fit small and negative-coordinate screens and their last item is reachable", async () =>
+        {
+            var entries = Enumerable.Range(0, 35).Select(i => new MenuEntry
+            {
+                Text = "菜单项 " + i, StartsGroup = i % 3 == 0, Action = () => { },
+            });
+            using var menu = new PopupMenu(entries, Theme.UiFont, Theme.UiFontSmall);
+            foreach (Rectangle screen in new[] { new Rectangle(0, 0, 640, 480), new Rectangle(-1280, -100, 1280, 720) })
+            {
+                var anchor = new Point(screen.Right - 30, screen.Bottom - 20);
+                Rectangle bounds = menu.CalculateBounds(anchor, anchor, screen);
+                Require(screen.Contains(bounds) && bounds.Width > 0 && bounds.Height > 0);
+            }
+            menu.Bounds = menu.CalculateBounds(new Point(600, 40), new Point(600, 30), new Rectangle(0, 0, 640, 480));
+            menu.Location = form.Location;
+            menu.Show(form);
+            var list = Field<ListBox>(menu, "_list");
+            Call(menu, "OnListKeyDown", list, new KeyEventArgs(Keys.End));
+            Equal(list.Items.Count - 1, list.SelectedIndex);
+            Rectangle last = list.GetItemRectangle(list.SelectedIndex);
+            Require(last.Top >= 0 && last.Bottom <= list.ClientSize.Height, "Last menu item cannot be reached");
+            Call(menu, "OnListKeyDown", list, new KeyEventArgs(Keys.Home));
+            Equal(0, list.SelectedIndex);
+            menu.Close();
+            await Task.CompletedTask;
+        });
 
         await Check("Closing the first window keeps the second window and its session", async () =>
         {
@@ -339,35 +515,150 @@ internal static class Program
             Require(!Directory.Exists(profile));
         });
 
-        await Check("Memory monitoring excludes other WebView2 environments", async () =>
+        await Check("CEF subprocesses use the browser executable and memory excludes unrelated descendants", async () =>
         {
             await WithManager(form, new AppSettings(), async tabs =>
             {
                 var tab = tabs.NewTab(UrlUtils.InternalHome);
                 await Loaded(tab);
-                var ownIds = MemoryMonitor.GetBrowserProcessIds();
-                Require(ownIds.Contains((int)tab.View.CoreWebView2.BrowserProcessId));
-                string otherRoot = Path.Combine(AppPaths.Root, "unregistered-profile");
-                var other = await TabManager.CreateEnvironmentAsync(otherRoot, false);
-                using var view = new Microsoft.Web.WebView2.WinForms.WebView2 { Dock = DockStyle.Fill };
-                form.Controls.Add(view);
+                using var unrelated = Process.Start(new ProcessStartInfo("ping.exe", "-t 127.0.0.1")
+                { UseShellExecute = false, CreateNoWindow = true })!;
                 try
                 {
-                    await view.EnsureCoreWebView2Async(other);
-                    int otherId = (int)view.CoreWebView2.BrowserProcessId;
-                    Require(!MemoryMonitor.GetBrowserProcessIds().Contains(otherId));
+                    var ownIds = MemoryMonitor.GetBrowserProcessIds();
+                    Require(ownIds.Count > 0);
+                    Require(!ownIds.Contains(Environment.ProcessId));
+                    Require(!ownIds.Contains(unrelated.Id));
+                    string expected = Path.GetFileNameWithoutExtension(BrowserRuntime.SubprocessPath);
+                    foreach (int id in ownIds)
+                    {
+                        using var process = Process.GetProcessById(id);
+                        Equal(expected, process.ProcessName);
+                    }
                     MemoryMonitor.Refresh();
-                    Require(MemoryMonitor.WebViewProcessCount > 0 && MemoryMonitor.WebViewWorkingSet > 0);
+                    Require(MemoryMonitor.KernelProcessCount > 0 && MemoryMonitor.KernelWorkingSet > 0);
                 }
-                finally { form.Controls.Remove(view); }
+                finally { unrelated.Kill(); await unrelated.WaitForExitAsync(); }
+            });
+        });
+
+        await Check("Private cookies are isolated from normal browsing and the next private window", async () =>
+        {
+            await WithManager(form, new AppSettings(), async normal =>
+            {
+                var tab = normal.NewTab(server.Url + "cookies");
+                await Loaded(tab);
+                await tab.View.ExecuteScriptAsync("document.cookie='normal=visible; path=/'");
+                await WithManager(form, new AppSettings(), async privateTabs =>
+                {
+                    var privateTab = privateTabs.NewTab(server.Url + "cookies");
+                    await Loaded(privateTab);
+                    Equal("\"\"", await privateTab.View.ExecuteScriptAsync("document.cookie"));
+                    await privateTab.View.ExecuteScriptAsync("document.cookie='private=secret; path=/'");
+                    Equal("\"normal=visible\"", await tab.View.ExecuteScriptAsync("document.cookie"));
+                }, incognito: true);
+                await WithManager(form, new AppSettings(), async privateTabs =>
+                {
+                    var privateTab = privateTabs.NewTab(server.Url + "cookies");
+                    await Loaded(privateTab);
+                    Equal("\"\"", await privateTab.View.ExecuteScriptAsync("document.cookie"));
+                }, incognito: true);
+            });
+        });
+
+        await Check("CEF downloads save the actual file and complete the download record", async () =>
+        {
+            await WithManager(form, new AppSettings(), async tabs =>
+            {
+                var tab = tabs.NewTab(server.Url + "download-page");
+                await Loaded(tab);
+                tab.View.DownloadHandler = new BrowserDownloadHandler(tab.View, tabs, showDialog: false,
+                    folder: Path.Combine(AppPaths.Root, "test-downloads"));
+                await tab.View.ExecuteScriptAsync("location.href='/file.bin'");
+                await Until(() => tabs.Downloads.Snapshot().Any(d => d.State == "done"));
+                var item = tabs.Downloads.Snapshot().First(d => d.State == "done");
+                Equal("feather-test-download", File.ReadAllText(item.Path));
+                Equal(21L, item.ReceivedBytes);
+            });
+        });
+
+        await Check("CEF back and forward restore real navigation and native find works with website scripts disabled", async () =>
+        {
+            await WithManager(form, new AppSettings { JavaScriptEnabled = false }, async tabs =>
+            {
+                var tab = tabs.NewTab(server.Url + "first");
+                await Loaded(tab);
+                tab.NavigateTo(server.Url + "second");
+                await Loaded(tab);
+                await Until(() => tab.CanGoBack);
+                tab.GoBack();
+                await Until(() => tab.Url == server.Url + "first" && tab.LastNavigationSucceeded == true);
+                await Until(() => tab.CanGoForward);
+                tab.GoForward();
+                await Until(() => tab.Url == server.Url + "second" && tab.LastNavigationSucceeded == true);
+                int matches = 0;
+                tab.View.FindHandler = new FindProbe(count => matches = count);
+                tab.Find("Test page", forward: true, firstMatch: true);
+                await Until(() => matches > 0);
+            });
+        });
+
+        await Check("window.open creates a browser tab without a separate native browser window", async () =>
+        {
+            await WithWindow(server.Url + "popup-source", async window =>
+            {
+                var tabs = GetTabs(window)!;
+                await tabs.Active.View.ExecuteScriptAsync("document.body.innerHTML='<button style=\"width:150px;height:60px\">Open</button>'; document.querySelector('button').onclick=()=>window.open('" + server.Url + "popup-target'); true");
+                var host = CefSharp.WebBrowserExtensions.GetBrowserHost(tabs.Active.View);
+                host.SendMouseClickEvent(new CefSharp.MouseEvent(30, 30, CefSharp.CefEventFlags.None), CefSharp.MouseButtonType.Left, false, 1);
+                host.SendMouseClickEvent(new CefSharp.MouseEvent(30, 30, CefSharp.CefEventFlags.None), CefSharp.MouseButtonType.Left, true, 1);
+                await Until(() => tabs.Count == 2 && tabs.Active.Url == server.Url + "popup-target");
+                await Loaded(tabs.Active);
             });
         });
     }
-
     private static MainForm HiddenWindow(string url, bool incognito = false) => new(url, incognito)
     {
         ShowInTaskbar = false, StartPosition = FormStartPosition.Manual, Location = new Point(-32000, -32000),
     };
+
+    private static async Task WithWindow(string url, Func<MainForm, Task> action)
+    {
+        using var window = HiddenWindow(url);
+        window.Show();
+        try
+        {
+            await Until(() => GetTabs(window)?.Active?.LastNavigationSucceeded == true);
+            await action(window);
+        }
+        finally { window.Close(); await window.CleanupTask; }
+    }
+
+    private static T Field<T>(object instance, string name) =>
+        (T)instance.GetType().GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(instance)!;
+
+    private static void Call(object instance, string method, params object[] args) =>
+        instance.GetType().GetMethod(method, BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(instance, args);
+
+    private static void AssertBrowserLayout(MainForm window)
+    {
+        window.PerformLayout();
+        var host = Field<Panel>(window, "_viewHost");
+        host.Parent!.PerformLayout();
+        Rectangle viewport = host.RectangleToScreen(host.ClientRectangle);
+        Require(viewport.Width > 0 && viewport.Height > 0);
+        foreach (string name in new[] { "_toolbar", "_tabStrip", "_progressHost", "_findBar", "_status" })
+        {
+            var chrome = Field<Control>(window, name);
+            if (chrome.Visible)
+                Require(!viewport.IntersectsWith(chrome.RectangleToScreen(chrome.ClientRectangle)),
+                    name + " overlaps the webpage");
+        }
+        var view = GetTabs(window)!.Active.View;
+        Equal(host.ClientSize, view.Size);
+        Equal(Point.Empty, view.Location);
+        Require(host.Visible && view.Visible);
+    }
 
     private static TabManager? GetTabs(MainForm form) =>
         (TabManager?)typeof(MainForm).GetField("_tabs", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(form);
@@ -378,21 +669,22 @@ internal static class Program
         using var parking = new Panel { Visible = false };
         form.Controls.Add(host);
         form.Controls.Add(parking);
-        var tabs = new TabManager(new BrowserContext(settings), host, parking, form, incognito,
+        var browserContext = new BrowserContext(settings);
+        var tabs = new TabManager(browserContext, host, parking, form, incognito,
             incognito ? Path.Combine(AppPaths.Root, "private-test-profile") : null);
         try { await tabs.InitializeAsync(); await action(tabs); }
-        finally { tabs.Shutdown(); form.Controls.Remove(host); form.Controls.Remove(parking); }
+        finally { tabs.Shutdown(); await tabs.WaitForViewsDisposedAsync(); await tabs.ReleasePrivateEnvironmentAsync(); browserContext.DisposeEnvironment(); form.Controls.Remove(host); form.Controls.Remove(parking); }
     }
 
     private static async Task Loaded(BrowserTab tab) =>
-        await Until(() => tab.View?.CoreWebView2 != null && tab.LastNavigationSucceeded == true);
+        await Until(() => tab.View?.Engine != null && tab.LastNavigationSucceeded == true);
 
     private static async Task UntilScript(BrowserTab tab, string script)
     {
         var timeout = Stopwatch.StartNew();
         while (timeout.ElapsedMilliseconds < 15000)
         {
-            if (await tab.View.CoreWebView2.ExecuteScriptAsync(script) == "true") return;
+            if (await tab.View.Engine.ExecuteScriptAsync(script) == "true") return;
             await Task.Delay(25);
         }
         throw new TimeoutException(script);
@@ -410,8 +702,10 @@ internal static class Program
 
     private static async Task Check(string name, Func<Task> action)
     {
+        Console.WriteLine("RUN " + name);
         try { await action(); Results.Add("PASS " + name); }
         catch (Exception ex) { Fail(name, ex); }
+        Console.WriteLine(Results.Last());
     }
 
     private static void Fail(string name, Exception ex)
@@ -425,6 +719,13 @@ internal static class Program
 
     private static void Equal<T>(T expected, T actual) =>
         Require(EqualityComparer<T>.Default.Equals(expected, actual), $"Expected {expected}, got {actual}");
+}
+
+internal sealed class FindProbe(Action<int> report) : CefSharp.Handler.FindHandler
+{
+    protected override void OnFindResult(CefSharp.IWebBrowser chromiumWebBrowser, CefSharp.IBrowser browser,
+        int identifier, int count, CefSharp.Structs.Rect selectionRect, int activeMatchOrdinal, bool finalUpdate)
+    { if (finalUpdate) report(count); }
 }
 
 internal sealed class TestServer : IDisposable
@@ -475,6 +776,11 @@ internal sealed class TestServer : IDisposable
                     Interlocked.Increment(ref _imageRequests);
                     body = Convert.FromBase64String("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j2ioAAAAASUVORK5CYII=");
                     contentType = "image/png";
+                }
+                else if (path.StartsWith("/file.bin"))
+                {
+                    body = Encoding.UTF8.GetBytes("feather-test-download");
+                    contentType = "application/octet-stream\r\nContent-Disposition: attachment; filename=regression.bin";
                 }
                 else
                 {

@@ -37,8 +37,8 @@ public static class AppPaths
 
     public static string LogFile => Path.Combine(Root, "feather.log");
 
-    /// <summary>WebView2 的用户数据目录，缓存与 Cookie 都在这里。</summary>
-    public static string WebViewDataFolder => Path.Combine(Root, "WebView2");
+    /// <summary>CEF 的用户数据目录。与旧 WebView2 缓存分开，保留旧版数据。</summary>
+    public static string BrowserDataFolder => Path.Combine(Root, "Chromium");
 
     /// <summary>用户自定义拦截规则，一行一个域名。</summary>
     public static string UserBlockListFile => Path.Combine(Root, "user_blocklist.txt");

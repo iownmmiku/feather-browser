@@ -91,7 +91,7 @@ internal static class SelfTest
                 };
                 MemoryMonitor.Refresh();
                 long baselineAvailable = MemoryMonitor.AvailablePhysical;
-                long baselineWebView = MemoryMonitor.WebViewWorkingSet;
+                long baselineWebView = MemoryMonitor.KernelWorkingSet;
                 Sample(report, "内核就绪（0 标签）");
                 report.AppendLine($"    → 基准可用内存 {MemoryMonitor.Mb(baselineAvailable)}，" +
                                   $"内核工作集 {MemoryMonitor.Mb(baselineWebView)}");
@@ -117,7 +117,7 @@ internal static class SelfTest
                 int tabsWithLivePeak = tabs.LiveCount;
                 report.AppendLine();
                 report.AppendLine($"标签总数 {tabs.Count}，其中真正持有渲染进程的 {tabs.LiveCount} 个" +
-                                  $"（历史上共创建过 {tabs.TotalCreated} 个 WebView2）");
+                                  $"（历史上共创建过 {tabs.TotalCreated} 个 Chromium 视图）");
 
                 // ---- 阶段 2：主动回收 ----
                 report.AppendLine();
@@ -146,7 +146,7 @@ internal static class SelfTest
                 Sample(report, "全部关闭后");
                 MemoryMonitor.Refresh();
                 long withOneTab = MemoryMonitor.AvailablePhysical;
-                long withOneTabWebView = MemoryMonitor.WebViewWorkingSet;
+                long withOneTabWebView = MemoryMonitor.KernelWorkingSet;
                 report.AppendLine($"  → 只剩 1 个首页标签时：系统可用 {MemoryMonitor.Mb(withOneTab)}，" +
                                   $"内核工作集 {MemoryMonitor.Mb(withOneTabWebView)}");
 
@@ -168,14 +168,14 @@ internal static class SelfTest
                 bool revived = await WaitForLoadAsync(revive, 25000);
                 report.AppendLine($"  切回最早那个标签：原档位 {(wasCold ? "休眠" : "非休眠")}，" +
                                   $"重新加载 {(revived ? "成功" : "失败")}，" +
-                                  $"本标签累计创建 WebView2 {revive.CreatedCount} 次");
+                                  $"本标签累计创建 Chromium 视图 {revive.CreatedCount} 次");
                 Sample(report, "恢复加载后");
 
                 report.AppendLine();
                 report.AppendLine("==== 小结 ====");
                 MemoryMonitor.Refresh();
                 long afterOpen = MemoryMonitor.AvailablePhysical;
-                long afterOpenWebView = MemoryMonitor.WebViewWorkingSet;
+                long afterOpenWebView = MemoryMonitor.KernelWorkingSet;
                 long sysDelta = withOneTab - afterOpen;
                 long webViewDelta = afterOpenWebView - withOneTabWebView;
 
@@ -201,7 +201,7 @@ internal static class SelfTest
                     "「开几十个标签内存也不线性增长」的原因");
                 report.AppendLine(
                     "· 本程序自身不打包 Chromium：FeatherBrowser.dll 约 160KB，" +
-                    "内核复用系统已安装的 Edge WebView2 运行时（全系统共用一份）");
+                    "内核复用系统已安装的 Edge Chromium 视图 运行时（全系统共用一份）");
                 report.AppendLine(
                     "· 把「同时渲染标签数」设为 1 内存会更低，代价是切标签时需要重新加载页面");
             }
@@ -254,14 +254,14 @@ internal static class SelfTest
         MemoryMonitor.Refresh();
         report.AppendLine(
             $"    [{label}] 本程序工作集 {MemoryMonitor.Mb(MemoryMonitor.WorkingSet)}" +
-            $" | 内核 {MemoryMonitor.WebViewProcessCount} 进程 {MemoryMonitor.Mb(MemoryMonitor.WebViewWorkingSet)}" +
+            $" | 内核 {MemoryMonitor.KernelProcessCount} 进程 {MemoryMonitor.Mb(MemoryMonitor.KernelWorkingSet)}" +
             $" | 系统可用 {MemoryMonitor.Mb(MemoryMonitor.AvailablePhysical)}");
     }
 
     /// <summary>
     /// 等待某个标签加载完成。
     ///
-    /// <p>WebView2 的事件都在 UI 线程上派发，而这里本身就是 UI 线程，
+    /// <p>Chromium 视图 的事件都在 UI 线程上派发，而这里本身就是 UI 线程，
     /// 所以要边抽消息边等，直到标签不再是加载状态。
     /// </summary>
     private static async Task<bool> WaitForLoadAsync(BrowserTab tab, int timeoutMs)

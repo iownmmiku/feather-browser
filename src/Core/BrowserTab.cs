@@ -1,19 +1,19 @@
 using FeatherBrowser.Services;
-using Microsoft.Web.WebView2.Core;
-using Microsoft.Web.WebView2.WinForms;
+using CefSharp;
+
 
 namespace FeatherBrowser.Core;
 
 /// <summary>标签的存活档位。</summary>
 public enum TabLife
 {
-    /// <summary>WebView2 已销毁，只剩 URL 等元数据。内存占用最低，界面显示为「休眠」。</summary>
+    /// <summary>BrowserView 已销毁，只剩 URL 等元数据。内存占用最低，界面显示为「休眠」。</summary>
     Cold = 0,
 
-    /// <summary>WebView2 存在但已被内核挂起。只在「窗口失去焦点」这类视图确实不可见的场景出现。</summary>
+    /// <summary>BrowserView 存在但已被内核挂起。只在「窗口失去焦点」这类视图确实不可见的场景出现。</summary>
     Suspended = 1,
 
-    /// <summary>WebView2 存活且正在渲染。界面显示为「渲染中」。</summary>
+    /// <summary>BrowserView 存活且正在渲染。界面显示为「渲染中」。</summary>
     Live = 2,
 }
 
@@ -32,7 +32,7 @@ public sealed class PageTheme
 ///
 /// <p>这是「低内存」的核心：只有 <see cref="TabLife.Live"/> 的标签才真正持有渲染进程。
 /// <list type="bullet">
-///   <item>超过「同时渲染标签数」上限的标签会被 <b>休眠</b>：Dispose 掉 WebView2，
+///   <item>超过「同时渲染标签数」上限的标签会被 <b>休眠</b>：Dispose 掉 BrowserView，
 ///         渲染进程退出，内存真正归还给系统。标签本身仍在列表里，切回去按原 URL 重新加载；</item>
 ///   <item>窗口失去焦点时，不可见的标签会先尝试 <b>挂起</b>（TrySuspend）：页面与滚动位置保留，
 ///         恢复更快，也能省下一部分内存。挂起失败不影响功能，下一轮策略会直接休眠它。</item>
@@ -50,7 +50,7 @@ public sealed class BrowserTab : IDisposable
     internal string CredentialPickToken { get; set; }
     internal string CredentialSource { get; set; }
 
-    internal bool OwnsView(WebView2 view) => !_disposed && ReferenceEquals(View, view) && !view.IsDisposed;
+    internal bool OwnsView(BrowserView view) => !_disposed && ReferenceEquals(View, view) && !view.IsDisposed;
 
     public string Id { get; } = Guid.NewGuid().ToString("N")[..8];
 
@@ -71,12 +71,13 @@ public sealed class BrowserTab : IDisposable
 
     public bool CanGoForward => View?.CanGoForward == true;
 
-    /// <summary>探针：本标签历史上创建过多少个 WebView2。用于验证回收确实发生。</summary>
+    /// <summary>探针：本标签历史上创建过多少个 BrowserView。用于验证回收确实发生。</summary>
     public int CreatedCount { get; private set; }
 
     public DateTime LastUsedAt { get; private set; } = DateTime.Now;
 
-    public WebView2 View { get; private set; }
+    public BrowserView View { get; private set; }
+    private int _viewGeneration;
 
     public event Action<BrowserTab> Changed;
 
@@ -135,10 +136,10 @@ public sealed class BrowserTab : IDisposable
     // ---------------------------------------------------------------- 视图生命周期
 
     /// <summary>
-    /// 取得 WebView2；如果已被销毁则重新创建，并在内核就绪后加载 <see cref="Url"/>。
+    /// 取得 BrowserView；如果已被销毁则重新创建，并在内核就绪后加载 <see cref="Url"/>。
     /// 因为是异步的，调用方（TabManager）只需 fire-and-forget，界面会在事件里自然刷新。
     /// </summary>
-    internal async Task<WebView2> ObtainViewAsync(Panel host, bool forceRecreate)
+    internal async Task<BrowserView> ObtainViewAsync(Panel host, bool forceRecreate)
     {
         if (_disposed || host.IsDisposed)
         {
@@ -154,7 +155,12 @@ public sealed class BrowserTab : IDisposable
             DestroyView();
         }
 
-        WebView2 view = _manager.CreateViewFor(this);
+        int generation = ++_viewGeneration;
+        // 合并同一轮界面消息中的快速切换；已关闭或切走的冷标签无需创建原生窗口。
+        await Task.Yield();
+        if (_disposed || host.IsDisposed || generation != _viewGeneration || _manager.Active != this) return null;
+
+        BrowserView view = _manager.CreateViewFor(this);
         View = view;
         CreatedCount++;
         Life = TabLife.Live;
@@ -213,12 +219,7 @@ public sealed class BrowserTab : IDisposable
         {
             View.DefaultBackgroundColor = Color.FromArgb(theme.BackgroundArgb);
 
-            if (View.CoreWebView2?.Profile != null)
-            {
-                View.CoreWebView2.Profile.PreferredColorScheme = theme.ForceDark
-                    ? CoreWebView2PreferredColorScheme.Dark
-                    : CoreWebView2PreferredColorScheme.Light;
-            }
+            View.ApplyPageTheme(theme.ForceDark);
         }
         catch
         {
@@ -246,8 +247,8 @@ public sealed class BrowserTab : IDisposable
 
     private async Task<bool> SuspendCoreAsync()
     {
-        WebView2 view = View;
-        if (View?.CoreWebView2 == null)
+        BrowserView view = View;
+        if (View?.Engine == null)
         {
             return false;
         }
@@ -263,7 +264,7 @@ public sealed class BrowserTab : IDisposable
 
         try
         {
-            bool ok = await view.CoreWebView2.TrySuspendAsync();
+            bool ok = await view.Engine.TrySuspendAsync();
             if (!OwnsView(view))
             {
                 return false;
@@ -271,7 +272,7 @@ public sealed class BrowserTab : IDisposable
             // 用户可能在挂起请求完成前已切回这个标签。
             if (!_suspendRequested)
             {
-                view.CoreWebView2.Resume();
+                await view.ResumeAsync();
                 Life = TabLife.Live;
                 RaiseChanged();
                 return false;
@@ -298,13 +299,13 @@ public sealed class BrowserTab : IDisposable
     internal void Resume()
     {
         _suspendRequested = false;
-        if (View?.CoreWebView2 == null)
+        if (View?.Engine == null)
         {
             return;
         }
         try
         {
-            View.CoreWebView2.Resume();
+            View.Engine.Resume();
             View.Visible = this == _manager.Active;
             Life = TabLife.Live;
             RaiseChanged();
@@ -315,10 +316,11 @@ public sealed class BrowserTab : IDisposable
         }
     }
 
-    /// <summary>销毁 WebView2，真正把渲染进程的内存交还给系统。</summary>
+    /// <summary>销毁 BrowserView，真正把渲染进程的内存交还给系统。</summary>
     internal void DestroyView()
     {
-        WebView2 view = View;
+        _viewGeneration++;
+        BrowserView view = View;
         View = null;
         CredentialPickToken = null;
         CredentialSource = null;
@@ -338,21 +340,17 @@ public sealed class BrowserTab : IDisposable
         {
             try
             {
-                view.CoreWebView2?.Stop();
+                view.Engine?.Stop();
             }
             catch
             {
                 // 忽略
             }
-            if (view.Parent is Control parent)
-            {
-                parent.Controls.Remove(view);
-            }
             view.Dispose();
         }
         catch (Exception ex)
         {
-            Log.Warn($"销毁标签 {Id} 的 WebView2 失败: {ex.Message}");
+            Log.Warn($"销毁标签 {Id} 的 BrowserView 失败: {ex.Message}");
         }
 
         RaiseChanged();
@@ -390,7 +388,7 @@ public sealed class BrowserTab : IDisposable
 
     private void Navigate(string target, bool isHtml)
     {
-        if (View?.CoreWebView2 == null)
+        if (View?.Engine == null)
         {
             return;
         }
@@ -404,7 +402,7 @@ public sealed class BrowserTab : IDisposable
             if (isHtml)
             {
                 Log.Info($"导航到内置首页 (HTML {target.Length} 字节)");
-                View.CoreWebView2.NavigateToString(target);
+                View.Engine.NavigateToString(target);
             }
             else if (target.StartsWith("feather://search?q=", StringComparison.OrdinalIgnoreCase))
             {
@@ -412,11 +410,11 @@ public sealed class BrowserTab : IDisposable
                 string query = Uri.UnescapeDataString(target["feather://search?q=".Length..]);
                 string url = UrlUtils.Normalize(query, _manager.Settings.Engine.Template);
                 Url = url;
-                View.CoreWebView2.Navigate(url);
+                View.Engine.Navigate(url);
             }
             else
             {
-                View.CoreWebView2.Navigate(target);
+                View.Engine.Navigate(target);
             }
         }
         catch (Exception ex)
@@ -433,7 +431,7 @@ public sealed class BrowserTab : IDisposable
     {
         if (View?.CanGoBack == true)
         {
-            View.CoreWebView2.GoBack();
+            View.Back();
         }
     }
 
@@ -441,7 +439,7 @@ public sealed class BrowserTab : IDisposable
     {
         if (View?.CanGoForward == true)
         {
-            View.CoreWebView2.GoForward();
+            View.Forward();
         }
     }
 
@@ -457,10 +455,10 @@ public sealed class BrowserTab : IDisposable
         {
             Resume();
         }
-        if (View.CoreWebView2 != null)
+        if (View.Engine != null)
         {
             LastNavigationSucceeded = null;
-            View.CoreWebView2.Reload();
+            View.Engine.Reload();
         }
     }
 
@@ -468,7 +466,7 @@ public sealed class BrowserTab : IDisposable
     {
         try
         {
-            View?.CoreWebView2?.Stop();
+            View?.Engine?.Stop();
         }
         catch
         {
@@ -489,7 +487,7 @@ public sealed class BrowserTab : IDisposable
         try
         {
             // 缩放由 WinForms 控件自身暴露（它转发给内核控制器），
-            // CoreWebView2 上没有 ZoomFactor 属性。
+            // Engine 上没有 ZoomFactor 属性。
             if (View != null)
             {
                 View.ZoomFactor = _zoomFactor;
@@ -501,268 +499,115 @@ public sealed class BrowserTab : IDisposable
         }
     }
 
-    /// <summary>
-    /// 页内查找。
-    ///
-    /// <p>官方托管 API 的 Find 系列在这个版本的 WebView2 SDK 里并不存在，
-    /// 因此改为注入一段小脚本自己实现：用 window.find 定位，配合高亮选中，
-    /// 逻辑只有十几行，也不会给页面留下常驻对象。
-    /// </summary>
+    /// <summary>使用 Chromium 原生页内查找，网页禁用 JavaScript 后也能查找。</summary>
     public void Find(string text, bool forward, bool firstMatch)
     {
-        if (View?.CoreWebView2 == null)
-        {
-            return;
-        }
-
-        try
-        {
-            if (string.IsNullOrEmpty(text))
-            {
-                _ = View.CoreWebView2.ExecuteScriptAsync(
-                    "try{window.getSelection().removeAllRanges();}catch(e){}");
-                return;
-            }
-
-            string escaped = text
-                .Replace("\\", "\\\\")
-                .Replace("'", "\\'")
-                .Replace("\r", "")
-                .Replace("\n", "");
-            string script = firstMatch
-                ? "(function(){window.__featherFind='" + escaped + "';" +
-                  "return window.find(window.__featherFind,false," +
-                  (forward ? "false" : "true") + ",true,false,false,false);})()"
-                : "(function(){return window.find(window.__featherFind||'" + escaped + "',false," +
-                  (forward ? "false" : "true") + ",true,false,false,false);})()";
-            _ = View.CoreWebView2.ExecuteScriptAsync(script);
-        }
-        catch
-        {
-            // 忽略查找失败
-        }
+        if (View?.Engine == null) return;
+        if (string.IsNullOrEmpty(text)) View.StopFinding(true);
+        else View.Find(text, forward, matchCase: false, findNext: !firstMatch);
     }
-
     // ---------------------------------------------------------------- 事件绑定
 
     /// <summary>把内核事件绑定到标签上。由 TabManager 在内核初始化完成后调用。</summary>
-    internal void BindCoreEvents(CoreWebView2 core)
+    internal void BindCoreEvents(BrowserView view)
     {
-        WebView2 view = View;
-        if (view == null || core == null)
-        {
-            return;
-        }
-
-        core.NavigationStarting += (_, e) =>
+        view.AddressChanged += (_, _) => view.Ui(() =>
         {
             if (!OwnsView(view)) return;
-            CredentialPickToken = null;
-            CredentialSource = null;
-            if (e.Uri.StartsWith("feather://search?q=", StringComparison.OrdinalIgnoreCase))
-            {
-                e.Cancel = true;
-                string query = Uri.UnescapeDataString(e.Uri["feather://search?q=".Length..]);
-                string target = UrlUtils.Normalize(query, _manager.Settings.Engine.Template);
-                view.BeginInvoke(() => { if (OwnsView(view)) NavigateTo(target); });
-                return;
-            }
-            core.Settings.IsScriptEnabled = _manager.Settings.JavaScriptEnabled ||
-                UrlUtils.IsInternal(e.Uri) || (IsHomePage && e.Uri == "about:blank");
-            IsLoading = true;
-            LastNavigationSucceeded = null;
-            Progress = 5;
-            _manager.NotifyNavigationStarting(this, e.Uri);
+            UpdateUrlFromView(view);
             RaiseChanged();
-        };
-
-        core.SourceChanged += (_, _) =>
+        });
+        view.TitleChanged += (_, e) =>
         {
-            if (!OwnsView(view)) return;
-            try
-            {
-                string source = core.Source;
-                if (!string.IsNullOrEmpty(source) &&
-                    !source.StartsWith("data:", StringComparison.OrdinalIgnoreCase) &&
-                    !(IsHomePage && source.Equals("about:blank", StringComparison.OrdinalIgnoreCase)))
-                {
-                    Url = source;
-                }
-            }
-            catch
-            {
-                // 忽略
-            }
+            string title = e.Title;
+            view.Ui(() => { if (OwnsView(view)) { Title = title; RaiseChanged(); } });
         };
-
-        core.DocumentTitleChanged += (_, _) =>
+        view.LoadingStateChanged += (_, _) => view.Ui(() => { if (OwnsView(view)) RaiseChanged(); });
+        view.FrameLoadEnd += (_, e) =>
         {
-            if (!OwnsView(view)) return;
-            try
+            if (!e.Frame.IsMain) return;
+            string source = e.Url;
+            int status = e.HttpStatusCode;
+            view.Ui(() =>
             {
-                string title = core.DocumentTitle;
-                if (!string.IsNullOrWhiteSpace(title))
-                {
-                    Title = title;
-                }
-            }
-            catch
-            {
-                // 忽略
-            }
-            RaiseChanged();
-        };
-
-        core.NavigationCompleted += (_, e) =>
-        {
-            if (!OwnsView(view)) return;
-            IsLoading = false;
-            LastNavigationSucceeded = e.IsSuccess;
-            Progress = 100;
-            if (e.IsSuccess)
-            {
+                if (!OwnsView(view) || !view.HasNavigated || source != view.Source || source == "about:blank") return;
+                IsLoading = false;
+                LastNavigationSucceeded = status == 0 || status < 400;
+                Progress = 100;
                 UpdateUrlFromView(view);
                 Touch();
-                _manager.NotifyNavigationCompleted(this);
-            }
-            else
-            {
-                _manager.NotifyNavigationFailed(this, e.WebErrorStatus.ToString());
-            }
-            RaiseChanged();
+                if (LastNavigationSucceeded == true)
+                {
+                    _manager.NotifyNavigationCompleted(this);
+                    _manager.InjectLoginHelper(this);
+                }
+                else _manager.NotifyNavigationFailed(this, "HTTP " + status);
+                RaiseChanged();
+            });
         };
-
-        core.FaviconChanged += (_, _) => RaiseChanged();
-
-        core.HistoryChanged += (_, _) => RaiseChanged();
-
-        core.NewWindowRequested += (_, e) =>
+        view.LoadError += (_, e) =>
         {
-            e.Handled = true;
-            _manager.NotifyNewWindowRequested(this, e.Uri);
+            if (!e.Frame.IsMain || e.ErrorCode == CefErrorCode.Aborted) return;
+            string failed = e.FailedUrl;
+            string error = e.ErrorText;
+            view.Ui(() =>
+            {
+                if (!OwnsView(view) || !view.HasNavigated || failed != view.Source) return;
+                IsLoading = false;
+                LastNavigationSucceeded = false;
+                Progress = 100;
+                _manager.NotifyNavigationFailed(this, error);
+                RaiseChanged();
+            });
         };
-
-        core.WindowCloseRequested += (_, _) => _manager.NotifyWindowCloseRequested(this);
-
-        // 内置管理页（书签 / 下载 / 历史）走虚拟主机映射：把 feather.local 指到页面目录。
-        // 曾经试过 feather:// 自定义协议 + WebResourceRequested，实测处理器根本不会被调用
-        // （WebView2 不为自定义协议触发该事件），导航直接 ConnectionAborted，页面全空白。
-        TabManager.MapInternalPages(core);
-
-        // 右键菜单：在内核自带的菜单上补充桌面浏览器的常规操作
-        core.ContextMenuRequested += (_, e) => _manager.NotifyContextMenuRequested(this, e);
-
-        // 下载：交给内核按浏览器默认方式存盘，我们只记录状态供下载页展示。
-        // 不接管字节流是有意的 —— 接管会让大文件多一次拷贝，也更容易出错。
-        core.DownloadStarting += (_, e) => _manager.HandleDownloadStarting(e);
-
-        // 内核进程意外消失时上报。
-        // 用户可能用任务管理器单独结束了某个渲染进程 —— 那时外壳还在，
-        // 但那个标签已经是死壳子。必须让宿主知道，才能自动恢复或给出提示，
-        // 而不是留一个「点了没反应也说不清哪坏了」的界面。
-        core.ProcessFailed += (_, e) =>
-        {
-            if (OwnsView(view))
-                _manager.NotifyProcessFailed(this, e.ProcessFailedKind.ToString(), e.Reason.ToString());
-        };
-
-        // 登录表单自动填充与内置管理页：页面发回的消息都在这里分流
-        core.WebMessageReceived += (_, e) =>
-        {
-            // 先无条件记录「事件到了」这件事本身。
-            // 之前这一步在 try 里面，处理器内部一抛异常就被空 catch 吞掉，
-            // 结果看上去像「页面的消息从来没发出来」，排查方向完全被带偏。
-            bool debug = Environment.GetEnvironmentVariable("FEATHER_DEBUG_MSG") == "1";
-            if (debug)
-            {
-                Log.Info("WebMessageReceived 事件已触发");
-            }
-
-            try
-            {
-                if (!OwnsView(view) || !string.Equals(e.Source, core.Source, StringComparison.Ordinal)) return;
-                string raw = e.TryGetWebMessageAsString();
-                if (debug)
-                {
-                    Log.Info($"页面消息长度: {raw?.Length ?? 0}");
-                }
-
-                // 内置管理页的消息是 JSON 对象（以 { 开头），自动填充的是自己的紧凑格式
-                if (!string.IsNullOrEmpty(raw) && raw.TrimStart().StartsWith("{"))
-                {
-                    if (InternalPages.Handles(e.Source))
-                        _manager.NotifyInternalPageMessage(this, raw, e.Source);
-                    return;
-                }
-
-                if (!_manager.Settings.PasswordAutofill || IsIncognito ||
-                    !Uri.TryCreate(e.Source, UriKind.Absolute, out var sourceUri) ||
-                    (sourceUri.Scheme != "https" && sourceUri.Scheme != "http")) return;
-                var parsed = LoginAutofill.ParseMessage(raw);
-                if (parsed == null)
-                {
-                    return;
-                }
-                switch (parsed.Value.Type)
-                {
-                    case "pick":
-                        if (!string.IsNullOrEmpty(CredentialPickToken) &&
-                            parsed.Value.Token == CredentialPickToken && e.Source == CredentialSource)
-                            _manager.NotifyCredentialPicked(this, parsed.Value.Id);
-                        break;
-                    case "submit":
-                        _manager.NotifyCredentialSubmitted(this, e.Source, parsed.Value.Username,
-                            parsed.Value.Password);
-                        break;
-                }
-            }
-            catch (Exception ex)
-            {
-                // 以前这里是空 catch：处理器自己出错时完全没有痕迹，
-                // 表现成「页面的消息没到」，非常容易被误导。现在一定留下日志。
-                Log.Warn($"处理页面消息失败: {ex.GetType().Name} / {ex.Message}");
-            }
-        };
-
-        // 每次页面加载完成都注入一次：SPA 的登录框常常是后渲染出来的，
-        // 脚本自身幂等（window.__featherLogin 标记），重复注入没有副作用。
-        core.DOMContentLoaded += (_, _) => _manager.InjectLoginHelper(this);
-
-        // 拦截钩子：满足条件时返回空响应
-        core.WebResourceRequested += (_, e) =>
-        {
-            try
-            {
-                if (e.ResourceContext == CoreWebView2WebResourceContext.Document)
-                {
-                    return;
-                }
-                bool blockImage = !_manager.Settings.LoadImages &&
-                    e.ResourceContext == CoreWebView2WebResourceContext.Image;
-                if (!blockImage && !_manager.AdBlock.ShouldBlock(e.Request.Uri, false))
-                {
-                    return;
-                }
-                e.Response = core.Environment.CreateWebResourceResponse(
-                    null, 200, "OK", "Content-Type: text/plain; charset=utf-8");
-            }
-            catch
-            {
-                // 拦截失败就让请求正常走
-            }
-        };
-        core.AddWebResourceRequestedFilter("*", CoreWebView2WebResourceContext.All);
+        view.PageMessageReceived += (source, raw) => HandlePageMessage(view, source, raw);
     }
 
-    private void UpdateUrlFromView(WebView2 view)
+    internal void OnNavigationStarting(BrowserView view, string url)
+    {
+        if (!OwnsView(view) || !view.HasNavigated) return;
+        CredentialPickToken = null;
+        CredentialSource = null;
+        if (url != BrowserView.HomeAddress && !url.StartsWith("about:") && !url.StartsWith("data:")) Url = url;
+        IsLoading = true;
+        LastNavigationSucceeded = null;
+        Progress = 5;
+        _manager.NotifyNavigationStarting(this, url);
+        RaiseChanged();
+    }
+
+    private void HandlePageMessage(BrowserView view, string source, string raw)
     {
         try
         {
-            string source = view.CoreWebView2?.Source;
+            if (!OwnsView(view) || source != view.Source || string.IsNullOrEmpty(raw)) return;
+            if (raw.TrimStart().StartsWith("{"))
+            {
+                if (InternalPages.Handles(source)) _manager.NotifyInternalPageMessage(this, raw, source);
+                return;
+            }
+            if (!_manager.Settings.PasswordAutofill || IsIncognito ||
+                !Uri.TryCreate(source, UriKind.Absolute, out var uri) ||
+                (uri.Scheme != "https" && uri.Scheme != "http")) return;
+            var parsed = LoginAutofill.ParseMessage(raw);
+            if (parsed == null) return;
+            if (parsed.Value.Type == "pick" && !string.IsNullOrEmpty(CredentialPickToken) &&
+                parsed.Value.Token == CredentialPickToken && source == CredentialSource)
+                _manager.NotifyCredentialPicked(this, parsed.Value.Id);
+            else if (parsed.Value.Type == "submit")
+                _manager.NotifyCredentialSubmitted(this, source, parsed.Value.Username, parsed.Value.Password);
+        }
+        catch (Exception ex) { Log.Warn("处理页面消息失败: " + ex.Message); }
+    }
+    private void UpdateUrlFromView(BrowserView view)
+    {
+        try
+        {
+            string source = view.Engine?.Source;
             // NavigateToString 之后 Source 会变成 about:blank，此时应保留原来的
             // feather://home 标记，否则首页会被误判成真实网页。
             if (string.IsNullOrEmpty(source) ||
-                source.StartsWith("about:", StringComparison.OrdinalIgnoreCase) ||
+                source == BrowserView.HomeAddress || source.StartsWith("about:", StringComparison.OrdinalIgnoreCase) ||
                 source.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
             {
                 return;

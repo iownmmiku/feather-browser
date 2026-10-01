@@ -42,7 +42,7 @@ function featherSet(el, value) {
 
 function featherPost(obj) {
   try {
-    window.chrome.webview.postMessage('feather:' + JSON.stringify(obj));
+    CefSharp.PostMessage('feather:' + JSON.stringify(obj));
   } catch (e) { }
 }
 

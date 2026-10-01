@@ -97,7 +97,7 @@ public class WinShot
         return sb.ToString();
     }
 
-    /// <summary>PW_RENDERFULLCONTENT，WebView2 需要这个标志才能被 PrintWindow 抓到内容。</summary>
+    /// <summary>PW_RENDERFULLCONTENT，浏览器需要这个标志才能被 PrintWindow 抓到内容。</summary>
     public static bool Grab(IntPtr h, IntPtr hdc)
     {
         return PrintWindow(h, hdc, 2);

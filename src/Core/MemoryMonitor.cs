@@ -2,49 +2,43 @@ using System.Diagnostics;
 using System.Runtime;
 using System.Runtime.InteropServices;
 using FeatherBrowser.Services;
-using Microsoft.Web.WebView2.Core;
+using Microsoft.Win32.SafeHandles;
 
 namespace FeatherBrowser.Core;
 
 /// <summary>
 /// 内存监控与主动回收。
 ///
-/// <p>WebView2 的内存分布在多个子进程里（浏览器进程 + 每个渲染进程），
-/// 只看本进程的 WorkingSet 会严重低估。这里只统计本程序所用环境的 WebView2 子进程，
-/// 这样「标签回收到底省了多少」是可观测的，而不是靠感觉。
+/// 统计本程序及其 CEF 子进程，排除其他窗口应用的进程。
 /// </summary>
 public static class MemoryMonitor
 {
-    // 环境由窗口注册；共享环境引用计数，所有调用都在 WebView2 的 UI 线程。
-    private static readonly Dictionary<CoreWebView2Environment, int> Environments = new();
-
-    internal static void RegisterEnvironment(CoreWebView2Environment environment)
-    {
-        Environments.TryGetValue(environment, out int count);
-        Environments[environment] = count + 1;
-    }
-
-    internal static void UnregisterEnvironment(CoreWebView2Environment environment)
-    {
-        if (!Environments.TryGetValue(environment, out int count)) return;
-        if (count == 1) Environments.Remove(environment);
-        else Environments[environment] = count - 1;
-    }
-
     internal static HashSet<int> GetBrowserProcessIds()
     {
         var ids = new HashSet<int>();
-        foreach (var environment in Environments.Keys)
+        using var snapshot = CreateToolhelp32Snapshot(2, 0);
+        if (snapshot.IsInvalid) return ids;
+        var entries = new Dictionary<int, (int Parent, string Name)>();
+        var entry = new PROCESSENTRY32 { dwSize = (uint)Marshal.SizeOf<PROCESSENTRY32>() };
+        if (!Process32First(snapshot, ref entry)) return ids;
+        do
         {
-            try
+            entries[(int)entry.th32ProcessID] = ((int)entry.th32ParentProcessID, entry.szExeFile);
+        } while (Process32Next(snapshot, ref entry));
+        var descendants = new HashSet<int> { Environment.ProcessId };
+        bool changed;
+        do
+        {
+            changed = false;
+            foreach (var process in entries)
             {
-                foreach (var info in environment.GetProcessInfos()) ids.Add(info.ProcessId);
+                if (descendants.Contains(process.Value.Parent) && descendants.Add(process.Key)) changed = true;
             }
-            catch (Exception ex)
-            {
-                Log.Warn("读取内核进程信息失败: " + ex.Message);
-            }
-        }
+        } while (changed);
+        string name = Path.GetFileName(BrowserRuntime.SubprocessPath);
+        foreach (int id in descendants)
+            if (id != Environment.ProcessId && entries.TryGetValue(id, out var process) &&
+                process.Name.Equals(name, StringComparison.OrdinalIgnoreCase)) ids.Add(id);
         return ids;
     }
     /// <summary>本进程私有字节（不含共享的渲染进程）。</summary>
@@ -53,11 +47,11 @@ public static class MemoryMonitor
     /// <summary>本进程工作集。</summary>
     public static long WorkingSet { get; private set; }
 
-    /// <summary>所有 WebView2 子进程的工作集合计。</summary>
-    public static long WebViewWorkingSet { get; private set; }
+    /// <summary>本应用所有 Chromium 子进程的工作集合计。</summary>
+    public static long KernelWorkingSet { get; private set; }
 
-    /// <summary>WebView2 进程数量。每个标签的渲染进程会体现在这里。</summary>
-    public static int WebViewProcessCount { get; private set; }
+    /// <summary>本应用 Chromium 子进程数量。</summary>
+    public static int KernelProcessCount { get; private set; }
 
     /// <summary>系统可用物理内存。</summary>
     public static long AvailablePhysical { get; private set; }
@@ -68,7 +62,7 @@ public static class MemoryMonitor
     {
         return $"可用 {Mb(AvailablePhysical)} / 共 {Mb(TotalPhysical)} · " +
                $"本程序 私有 {Mb(PrivateBytes)}，工作集 {Mb(WorkingSet)} · " +
-               $"内核进程 {WebViewProcessCount} 个 共 {Mb(WebViewWorkingSet)}";
+               $"内核进程 {KernelProcessCount} 个 共 {Mb(KernelWorkingSet)}";
     }
 
     public static string Mb(long bytes) => (bytes / 1024 / 1024) + " MB";
@@ -105,8 +99,8 @@ public static class MemoryMonitor
                     // 进程可能刚好退出
                 }
             }
-            WebViewWorkingSet = total;
-            WebViewProcessCount = count;
+            KernelWorkingSet = total;
+            KernelProcessCount = count;
         }
         catch
         {
@@ -131,7 +125,7 @@ public static class MemoryMonitor
     /// <summary>
     /// 把已经空出来的工作集立刻还给系统。
     ///
-    /// <p>.NET 的 GC 默认不会主动归还页面给操作系统，销毁大量 WebView2 之后
+    /// <p>.NET 的 GC 默认不会主动归还页面给操作系统，销毁大量浏览器视图之后
     /// 工作集数字仍然虚高。这里做一次紧凑回收 + 清空工作集，让任务管理器里的数字
     /// 与真实占用一致。
     /// </summary>
@@ -160,6 +154,26 @@ public static class MemoryMonitor
     }
 
     // ---------------------------------------------------------------- P/Invoke
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct PROCESSENTRY32
+    {
+        public uint dwSize, cntUsage, th32ProcessID;
+        public IntPtr th32DefaultHeapID;
+        public uint th32ModuleID, cntThreads, th32ParentProcessID;
+        public int pcPriClassBase;
+        public uint dwFlags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string szExeFile;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern SafeFileHandle CreateToolhelp32Snapshot(uint flags, uint processId);
+    [DllImport("kernel32.dll", EntryPoint = "Process32FirstW", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool Process32First(SafeFileHandle snapshot, ref PROCESSENTRY32 entry);
+    [DllImport("kernel32.dll", EntryPoint = "Process32NextW", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool Process32Next(SafeFileHandle snapshot, ref PROCESSENTRY32 entry);
 
     [StructLayout(LayoutKind.Sequential)]
     private sealed class MEMORYSTATUSEX

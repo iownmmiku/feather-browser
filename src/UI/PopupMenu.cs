@@ -34,6 +34,7 @@ internal sealed class PopupMenu : Form
     private readonly Font _font;
     private readonly Font _smallFont;
     private readonly int _rowHeight;
+    private readonly int _separatorHeight;
 
     /// <summary>鼠标悬停的条目下标。自绘高亮靠它，不再依赖 ListBox 的选中态。</summary>
     private int _hoverIndex = -1;
@@ -47,7 +48,6 @@ internal sealed class PopupMenu : Form
         FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.Manual;
         ShowInTaskbar = false;
-        TopMost = true;
         Font = _font;
         BackColor = Theme.Background;
         ForeColor = Theme.Text;
@@ -55,25 +55,25 @@ internal sealed class PopupMenu : Form
         DoubleBuffered = true;
 
         _rowHeight = _font.Height + Theme.Sy(14);
+        _separatorHeight = Theme.Sy(12);
 
         _list = new ListBox
         {
             Dock = DockStyle.Fill,
             BorderStyle = BorderStyle.None,
-            DrawMode = DrawMode.OwnerDrawFixed,
+            DrawMode = DrawMode.OwnerDrawVariable,
             ItemHeight = _rowHeight,
             IntegralHeight = false,
             BackColor = Theme.Background,
             ForeColor = Theme.Text,
             Font = _font,
 
-            // 关键：这里不要原生滚动条。
-            // 菜单高度是按条目数算好的（上限 22 行），正常不需要滚动；
-            // 而 Windows 的原生滚动条不受自绘控制，在深色主题下仍是白色，
-            // 会在面板右侧显出一条很显眼的白边。内容真的超长时靠滚轮滚动。
+            // 超出屏幕高度时保留原生滚动能力，滚轮和键盘都能到达最后一项。
             ScrollAlwaysVisible = false,
             HorizontalScrollbar = false,
         };
+        _list.MeasureItem += (_, e) => e.ItemHeight =
+            _list.Items[e.Index] is MenuEntry { Text: "-" } ? _separatorHeight : _rowHeight;
         _list.DrawItem += OnDrawItem;
         _list.KeyDown += OnListKeyDown;
         _list.MouseMove += OnListMouseMove;
@@ -101,71 +101,59 @@ internal sealed class PopupMenu : Form
             _list.Items.Add(item);
         }
 
-        // 宽度按最长文字估算，高度按条目数，都限制在屏幕内
+        // 显示时再按锚点所在屏幕的工作区限制尺寸。
         int width = Theme.Sx(268);
         foreach (MenuEntry item in _items)
         {
+            string trailing = string.IsNullOrEmpty(item.Value) ? item.Shortcut : item.Value;
             int textWidth = TextRenderer.MeasureText(item.Text, _font).Width
-                            + TextRenderer.MeasureText(item.Shortcut, _smallFont).Width;
+                            + TextRenderer.MeasureText(trailing, _smallFont).Width;
             width = Math.Max(width, textWidth + Theme.Sx(72));
         }
         Width = Math.Min(width, Theme.Sx(400));
-        Height = Math.Min(_list.Items.Count, 22) * _rowHeight + Theme.Sy(12);
+        Height = _list.Items.Cast<MenuEntry>().Sum(item =>
+            item.Text == "-" ? _separatorHeight : _rowHeight) + Theme.Sy(12);
 
         Deactivate += (_, _) => Close();
     }
 
     /// <summary>在指定屏幕坐标弹出（用于标签栏等非控件锚点的场景）。</summary>
-    public void ShowAtScreen(Point screenPoint)
+    public void ShowAtScreen(Point screenPoint, Form owner)
     {
-        using (GraphicsPath path = Theme.RoundedRect(
-                   new Rectangle(0, 0, Width, Height), Theme.Radius))
-        {
-            Region = new Region(path);
-        }
-        Padding = new Padding(Theme.Sx(6), Theme.Sy(6), Theme.Sx(6), Theme.Sy(6));
-
-        Rectangle wa = Screen.FromPoint(screenPoint).WorkingArea;
-        int x = Math.Min(screenPoint.X, wa.Right - Width - Theme.Sx(6));
-        int y = screenPoint.Y;
-        if (y + Height > wa.Bottom)
-        {
-            y = screenPoint.Y - Height;
-        }
-        x = Math.Max(wa.Left + Theme.Sx(6), x);
-        y = Math.Max(wa.Top + Theme.Sx(6), y);
-
-        Location = new Point(x, y);
-        Show();
-        Activate();
-        _list.Focus();
+        ShowPopup(screenPoint, screenPoint, owner);
     }
 
     /// <summary>在指定控件的下方或上方弹出。</summary>
     public void ShowAt(Control anchor)
     {
-        // 圆角外观：窗口整体裁成一个圆角矩形
+        Point below = anchor.PointToScreen(new Point(0, anchor.Height + Theme.Sy(4)));
+        Point above = anchor.PointToScreen(new Point(0, -Theme.Sy(4)));
+        ShowPopup(below, above, anchor.FindForm());
+    }
+
+    internal Rectangle CalculateBounds(Point below, Point above, Rectangle workingArea)
+    {
+        int margin = Math.Min(Theme.Sx(6), Math.Min(workingArea.Width, workingArea.Height) / 4);
+        Rectangle available = Rectangle.Inflate(workingArea, -margin, -margin);
+        int width = Math.Min(Width, available.Width);
+        int height = Math.Min(Height, available.Height);
+        int x = Math.Clamp(below.X, available.Left, available.Right - width);
+        int y = below.Y + height <= available.Bottom ? below.Y : above.Y - height;
+        y = Math.Clamp(y, available.Top, available.Bottom - height);
+        return new Rectangle(x, y, width, height);
+    }
+
+    private void ShowPopup(Point below, Point above, Form owner)
+    {
+        if (owner == null || owner.IsDisposed) { Dispose(); return; }
+        Bounds = CalculateBounds(below, above, Screen.FromPoint(below).WorkingArea);
+        Padding = new Padding(Theme.Sx(6), Theme.Sy(6), Theme.Sx(6), Theme.Sy(6));
         using (GraphicsPath path = Theme.RoundedRect(
                    new Rectangle(0, 0, Width, Height), Theme.Radius))
         {
             Region = new Region(path);
         }
-        Padding = new Padding(Theme.Sx(6), Theme.Sy(6), Theme.Sx(6), Theme.Sy(6));
-
-        Point screen = anchor.PointToScreen(new Point(0, anchor.Height));
-        Rectangle wa = Screen.FromControl(anchor).WorkingArea;
-
-        int x = Math.Min(screen.X, wa.Right - Width - Theme.Sx(6));
-        int y = screen.Y + Theme.Sy(4);
-        if (y + Height > wa.Bottom)
-        {
-            y = anchor.PointToScreen(Point.Empty).Y - Height - Theme.Sy(4);
-        }
-        x = Math.Max(wa.Left + Theme.Sx(6), x);
-        y = Math.Max(wa.Top + Theme.Sx(6), y);
-
-        Location = new Point(x, y);
-        Show();
+        Show(owner);
         Activate();
         _list.Focus();
     }
@@ -224,8 +212,16 @@ internal sealed class PopupMenu : Form
         {
             return;
         }
+        Form owner = Owner;
         Close();
-        BeginInvoke(entry.Action);
+        if (owner is { IsDisposed: false, IsHandleCreated: true })
+        {
+            // Close 会销毁菜单的句柄，后续动作必须派发到仍存活的主窗口。
+            owner.BeginInvoke(() =>
+            {
+                if (!owner.IsDisposed) entry.Action();
+            });
+        }
     }
 
     private void OnListKeyDown(object sender, KeyEventArgs e)
@@ -241,40 +237,39 @@ internal sealed class PopupMenu : Form
                 e.Handled = true;
                 break;
             case Keys.Down:
-                if (_list.SelectedIndex < _list.Items.Count - 1)
-                {
-                    _list.SelectedIndex++;
-                    SkipSeparator(1);
-                }
+                SelectNext(1);
                 e.Handled = true;
                 break;
             case Keys.Up:
-                if (_list.SelectedIndex > 0)
-                {
-                    _list.SelectedIndex--;
-                    SkipSeparator(-1);
-                }
+                SelectNext(-1);
+                e.Handled = true;
+                break;
+            case Keys.Home:
+                _list.SelectedIndex = -1;
+                SelectNext(1);
+                e.Handled = true;
+                break;
+            case Keys.End:
+                _list.SelectedIndex = -1;
+                SelectNext(-1);
                 e.Handled = true;
                 break;
         }
     }
 
-    private void SkipSeparator(int direction)
+    private void SelectNext(int direction)
     {
-        for (int guard = 0; guard < 4; guard++)
+        int next = _list.SelectedIndex < 0
+            ? (direction > 0 ? 0 : _list.Items.Count - 1)
+            : _list.SelectedIndex + direction;
+        while (next >= 0 && next < _list.Items.Count)
         {
-            if (_list.SelectedItem is MenuEntry entry && entry.Text == "-")
+            if (_list.Items[next] is MenuEntry { Text: not "-" })
             {
-                int next = _list.SelectedIndex + direction;
-                if (next < 0 || next >= _list.Items.Count)
-                {
-                    _list.SelectedIndex -= direction;
-                    return;
-                }
                 _list.SelectedIndex = next;
-                continue;
+                return;
             }
-            return;
+            next += direction;
         }
     }
 
@@ -319,26 +314,24 @@ internal sealed class PopupMenu : Form
             Theme.FillRounded(g, row, Theme.Radius, Theme.AccentSoft);
         }
 
+        string trailing = string.IsNullOrEmpty(entry.Value) ? entry.Shortcut : entry.Value;
+        int rightWidth = string.IsNullOrEmpty(trailing) ? 0 :
+            Math.Min(e.Bounds.Width / 2, TextRenderer.MeasureText(trailing, _smallFont).Width + Theme.Sx(8));
         Rectangle textRect = new(e.Bounds.Left + Theme.Sx(16), e.Bounds.Top,
-            e.Bounds.Width - Theme.Sx(126), e.Bounds.Height);
+            Math.Max(1, e.Bounds.Width - rightWidth - Theme.Sx(40)), e.Bounds.Height);
         TextRenderer.DrawText(g, entry.Text, _font, textRect,
             hover ? Theme.Text : Theme.Text,
-            TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+            TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding |
+            TextFormatFlags.EndEllipsis);
 
-        if (!string.IsNullOrEmpty(entry.Value))
+        if (!string.IsNullOrEmpty(trailing))
         {
-            Rectangle valueRect = new(e.Bounds.Right - Theme.Sx(110), e.Bounds.Top,
-                Theme.Sx(94), e.Bounds.Height);
-            TextRenderer.DrawText(g, entry.Value, _smallFont, valueRect, Theme.Accent,
-                TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
-        }
-
-        if (!string.IsNullOrEmpty(entry.Shortcut))
-        {
-            Rectangle shortcutRect = new(e.Bounds.Right - Theme.Sx(124), e.Bounds.Top,
-                Theme.Sx(108), e.Bounds.Height);
-            TextRenderer.DrawText(g, entry.Shortcut, _smallFont, shortcutRect, Theme.TextDim,
-                TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+            Rectangle trailingRect = new(e.Bounds.Right - rightWidth - Theme.Sx(16), e.Bounds.Top,
+                rightWidth, e.Bounds.Height);
+            TextRenderer.DrawText(g, trailing, _smallFont, trailingRect,
+                string.IsNullOrEmpty(entry.Value) ? Theme.TextDim : Theme.Accent,
+                TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding |
+                TextFormatFlags.EndEllipsis);
         }
     }
 

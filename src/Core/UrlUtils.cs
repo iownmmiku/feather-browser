@@ -393,7 +393,7 @@ public static class UrlUtils
           .Append(".quick a:hover{color:").Append(textMain).Append("}")
           .Append("footer{position:fixed;bottom:16px;color:").Append(textFoot).Append(";font-size:11px}")
           .Append("</style></head><body>")
-          .Append("<h1>轻羽浏览器</h1><p class=\"sub\">Windows 原生 · 低内存 · 基于 Edge 内核</p>")
+          .Append("<h1>轻羽浏览器</h1><p class=\"sub\">Windows 原生 · 低内存 · 基于 Chromium 内核</p>")
           .Append("<form onsubmit=\"go(event)\"><input id=\"q\" placeholder=\"搜索 ")
           .Append(Escape(searchName))
           .Append(" 或输入网址\" autocomplete=\"off\"><button type=\"submit\">前往</button></form>")

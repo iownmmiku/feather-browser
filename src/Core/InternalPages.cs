@@ -4,27 +4,13 @@ using FeatherBrowser.Services;
 namespace FeatherBrowser.Core;
 
 /// <summary>
-/// 内置管理页（书签 / 下载 / 历史）的页面定义与落盘。
-///
-/// <para><b>为什么不用 feather:// 自定义协议。</b>
-/// 一开始的写法是 web 资源拦截（<c>WebResourceRequested</c>）+ <c>feather://</c> 地址，
-/// 实测两条路都不通：
-/// <list type="bullet">
-///   <item><c>AddWebResourceRequestedFilter("feather://*")</c> 不报错也不生效，
-///         导航直接以 <c>ConnectionAborted</c> 失败；</item>
-///   <item>改成注册 <c>*</c> / All 之后处理器**依然一次都没被调用** ——
-///         因为 WebView2 对自定义协议根本不走这个事件。</item>
-/// </list>
-/// 结果是页面全空白，而且日志里看不出原因。</para>
-///
-/// <para><b>现在的做法</b>：把页面生成为磁盘上的 HTML，再用
-/// <c>SetVirtualHostNameToFolderMapping</c> 把 <c>feather.local</c> 映射到那个目录。
-/// 于是地址是普通的 <c>https://feather.local/bookmarks.html</c>，走标准 HTTP 加载路径，
-/// 行为确定、地址栏可见、来源独立。数据通过 <c>postMessage</c> 往返，页面不自己持久化。</para>
+/// 内置管理页（书签、下载、历史）生成本地 HTML。
+/// CEF 资源处理器仅在 https://feather.local/ 提供这些文件；
+/// 页面通过来源校验的消息桥向宿主请求数据和操作。
 /// </summary>
 internal static class InternalPages
 {
-    /// <summary>虚拟主机名（注册为安全的自定义 scheme，见 TabManager）。</summary>
+    /// <summary>内置页面专用主机名（见 BrowserResourceHandler）。</summary>
     public const string Host = "feather.local";
 
     public const string BookmarksFile = "bookmarks.html";
@@ -193,14 +179,14 @@ main { padding: 8px 24px 48px; }
 // 表现为数据永远不来（页面一直停在「正在载入…」），而且日志里什么都没有。
 // 所以这里改成：可发送就发，发不出去就重试若干次，最后仍失败就明确报错。
 function send(kind, payload) {
-  const bridge = window.chrome && window.chrome.webview;
+  const bridge = window.CefSharp;
   if (!bridge) return false;
   try {
     // 一定要传**字符串**，不能传对象。
     // 传对象时宿主用 TryGetWebMessageAsString() 取会抛
     // ArgumentException("Value does not fall within the expected range.")，
     // 而且该异常容易被外层空 catch 吞掉，表现成「消息根本没发出来」，极难排查。
-    bridge.postMessage(JSON.stringify(Object.assign({ feather: kind }, payload || {})));
+    bridge.PostMessage(JSON.stringify(Object.assign({ feather: kind }, payload || {})));
     return true;
   } catch (e) {
     return false;

@@ -2,8 +2,9 @@ using System.Diagnostics;
 using System.Text.Json;
 using FeatherBrowser.Core;
 using FeatherBrowser.Services;
-using Microsoft.Web.WebView2.Core;
-using Microsoft.Web.WebView2.WinForms;
+using CefSharp;
+using DownloadItem = FeatherBrowser.Core.DownloadItem;
+
 
 namespace FeatherBrowser.UI;
 
@@ -48,6 +49,7 @@ internal sealed class MainForm : Form
     private Panel _addressBox;
     private TextBox _address;
     private Panel _progressHost;
+    private Panel _contentHost;
     private Panel _viewHost;
     private Panel _parking;
     private StatusBar _status;
@@ -102,7 +104,7 @@ internal sealed class MainForm : Form
 
         if (incognito)
         {
-            // 无痕窗口使用独立的临时数据目录，关闭后整体删除，不留痕迹。
+            // 无痕窗口使用独立的内存 Cookie 和缓存；临时路径只用于兼容旧版清理。
             _temporaryDataFolder = Path.Combine(Path.GetTempPath(),
                 "FeatherIncognito_" + Guid.NewGuid().ToString("N")[..8]);
         }
@@ -217,7 +219,7 @@ internal sealed class MainForm : Form
             ShowTabMenu = ShowTabContextMenu,
         };
 
-        // 标签侧边栏：画在主窗口内的常规控件，Dock=Right，默认收成 0 宽隐藏
+        // 网页与侧边栏共用内容区，侧边栏展开时给网页让出宽度。
         _sidebar = new TabsSidebar
         {
             ActivateTab = index => _tabs?.Activate(index),
@@ -227,28 +229,25 @@ internal sealed class MainForm : Form
             ShowMemoryDialog = ShowMemoryDialog,
         };
 
-        // 注意控件添加顺序：Dock=Top/Right 的控件按添加顺序从外到内堆叠。
-        // 所以最外层（标签栏）要放在最前面，最内层（网页容器）放最后。
-        Controls.Add(_tabStrip);
-        Controls.Add(_viewHost);
+        _contentHost = new Panel { Dock = DockStyle.Fill };
+        _contentHost.Controls.Add(_viewHost);
+        _contentHost.Controls.Add(_sidebar);
+
+        // WinForms 按反向 Z 顺序执行 Dock：先为工具栏、标签栏等留位，最后填网页。
+        // 不对这些 Dock 控件调用 BringToFront，否则会改变布局次序并遮住网页顶部。
+        Controls.Add(_contentHost);
         Controls.Add(_findBar);
         Controls.Add(_progressHost);
+        Controls.Add(_tabStrip);
         Controls.Add(_toolbar);
         Controls.Add(_status);
         Controls.Add(_parking);
-        Controls.Add(_sidebar);
 
         _toolbar.Resize += (_, _) => LayoutToolbar();
         LayoutToolbar();
     }
 
-    /// <summary>
-    /// 展开 / 收起标签侧边栏。
-    ///
-    /// <p>做法是「侧边栏与网页容器二选一显示」，而不是让两者并存。
-    /// 一开始想用「宽度归零 + Dock 自动让位」，但那样需要一次布局才能算出尺寸，
-    /// 展开瞬间会拿到 Height=0 而画不出来。直接切 Visible 最可靠、也没有过渡态问题。
-    /// </summary>
+    /// <summary>展开 / 收起标签侧边栏，网页始终保留在相邻的内容区域。</summary>
     private void ToggleSidebar()
     {
         if (_tabs == null)
@@ -257,20 +256,11 @@ internal sealed class MainForm : Form
         }
         _sidebarShown = !_sidebarShown;
 
-        if (_sidebarShown)
-        {
-            UpdateSidebar();
-            _sidebar.Width = _sidebar.ExpandedWidth;
-            _sidebar.Visible = true;
-            _sidebar.BringToFront();
-            _viewHost.Visible = false;
-        }
-        else
-        {
-            _sidebar.Visible = false;
-            _viewHost.Visible = true;
-            _viewHost.BringToFront();
-        }
+        _contentHost.SuspendLayout();
+        _sidebar.Width = _sidebar.ExpandedWidth;
+        _sidebar.Visible = _sidebarShown;
+        _contentHost.ResumeLayout(performLayout: true);
+        UpdateSidebar();
 
         _btnTabs.Active = _sidebarShown;
         _btnTabs.Invalidate();
@@ -337,7 +327,7 @@ internal sealed class MainForm : Form
         _addressBox.Controls.Add(_address);
 
         _btnStar = MakeToolButton("\u2606", "收藏此页 (Ctrl+D)", ToggleBookmark);
-        _btnTabs = MakeToolButton("\u25A6", "标签列表 (Ctrl+Shift+T)", ShowTabList);
+        _btnTabs = MakeToolButton("\u25A6", "标签列表 (Ctrl+Shift+E)", ShowTabList);
         _btnMenu = MakeToolButton("\u2630", "菜单 (Alt+F)", ShowMenu);
 
         _toolbar.Controls.Add(_btnBack);
@@ -512,6 +502,7 @@ internal sealed class MainForm : Form
         MinimumSize = new Size(Theme.Sx(620), Theme.Sy(420));
 
         _toolbar.Height = Theme.Sy(52);
+        _tabStrip.Height = Theme.Sy(38);
         _progressHost.Height = Theme.Sy(4);
         _findBar.Height = Theme.Sy(48);
         _status.Font = Theme.UiFontSmall;
@@ -563,7 +554,7 @@ internal sealed class MainForm : Form
         ApplyPageTheme();
     }
 
-    /// <summary>把当前主题同步到 WebView2 环境（底色 + 站点配色偏好）。</summary>
+    /// <summary>把当前主题同步到 CEF 环境（底色 + 站点配色偏好）。</summary>
     private void ApplyPageTheme()
     {
         _viewHost.BackColor = Theme.PageBackground;
@@ -578,6 +569,11 @@ internal sealed class MainForm : Form
         _tabs = new TabManager(_context, _viewHost, _parking, this,
             _incognito, _temporaryDataFolder, _downloads);
         _tabs.TabsChanged += () => UpdateChrome();
+        _tabs.DownloadsChanged += () =>
+        {
+            foreach (var tab in _tabs.Tabs.Where(t => t.Url == InternalPages.DownloadsUrl && t.View?.Engine != null))
+                PushDownloads(tab);
+        };
         _tabs.NewWindowRequested += url =>
         {
             if (IsHandleCreated)
@@ -629,10 +625,10 @@ internal sealed class MainForm : Form
         catch (Exception ex)
         {
             if (_closing || IsDisposed) return;
-            Log.Error("初始化 WebView2 失败", ex);
+            Log.Error("初始化 CEF 失败", ex);
             MessageBox.Show(this,
-                "无法启动浏览器内核（WebView2 运行时）。\r\n\r\n" +
-                "请确认系统已安装 Microsoft Edge WebView2 Runtime。\r\n" +
+                "无法启动浏览器内核（CEF Chromium）。\r\n\r\n" +
+                "请重新安装轻羽浏览器，确认安装目录中的 Chromium 文件完整。\r\n" +
                 "错误信息：" + ex.Message,
                 AppTitle, MessageBoxButtons.OK, MessageBoxIcon.Error);
             Close();
@@ -755,7 +751,7 @@ internal sealed class MainForm : Form
                                 Log.Info($"内置页自检: url={url} Handles={InternalPages.Handles(url)}");
                                 // 页面异步加载并等宿主推数据，要给它时间
                                 await Task.Delay(3000);
-                                string text = await _tabs.Active.View.CoreWebView2
+                                string text = await _tabs.Active.View.Engine
                                     .ExecuteScriptAsync("document.body.innerText");
                                 Log.Info("内置页文本: " + text);
                             }
@@ -864,7 +860,7 @@ internal sealed class MainForm : Form
         MemoryMonitor.Refresh();
         string text =
             $"标签 {_tabs.Count}（渲染 {_tabs.LiveCount} / 休眠 {_tabs.ColdCount}）" +
-            $" · 内核 {MemoryMonitor.WebViewProcessCount} 进程 {MemoryMonitor.Mb(MemoryMonitor.WebViewWorkingSet)}" +
+            $" · 内核 {MemoryMonitor.KernelProcessCount} 进程 {MemoryMonitor.Mb(MemoryMonitor.KernelWorkingSet)}" +
             $" · 本程序 {MemoryMonitor.Mb(MemoryMonitor.WorkingSet)}" +
             $" · 拦截 {_adBlock.BlockedCount}";
         _status.SetRight(text);
@@ -1094,8 +1090,8 @@ internal sealed class MainForm : Form
             });
         }
 
-        using var menu = new PopupMenu(items, Theme.UiFont, Theme.UiFontSmall);
-        menu.ShowAtScreen(screenPoint);
+        var menu = new PopupMenu(items, Theme.UiFont, Theme.UiFontSmall);
+        menu.ShowAtScreen(screenPoint, this);
     }
 
     private void CloseOthers(int keepIndex)
@@ -1160,8 +1156,8 @@ internal sealed class MainForm : Form
     /// </summary>
     private void OnInternalPageMessage(BrowserTab tab, string json, string source)
     {
-        if (_closing || tab?.View?.CoreWebView2 == null || !InternalPages.Handles(source) ||
-            !string.Equals(tab.View.CoreWebView2.Source, source, StringComparison.Ordinal)) return;
+        if (_closing || tab?.View?.Engine == null || !InternalPages.Handles(source) ||
+            !string.Equals(tab.View.Engine.Source, source, StringComparison.Ordinal)) return;
         string kind;
         try
         {
@@ -1381,107 +1377,30 @@ internal sealed class MainForm : Form
     /// <para>刻意保留内核自带的项（复制、粘贴、检查等）—— 全部自绘的收益不大，
     /// 却会丢掉拼写检查、输入法、无障碍这些成熟行为。这里只做加法。</para>
     /// </summary>
-    private void OnContextMenuRequested(BrowserTab tab,
-        CoreWebView2ContextMenuRequestedEventArgs e)
+    private void OnContextMenuRequested(BrowserTab tab, BrowserContextMenu menu)
     {
-        try
+        string link = menu.LinkUrl;
+        string selection = menu.SelectionText;
+        if (!string.IsNullOrEmpty(link))
         {
-            IList<CoreWebView2ContextMenuItem> menu = e.MenuItems;
-            string link = e.ContextMenuTarget?.LinkUri;
-            string selection = e.ContextMenuTarget?.SelectionText;
-
-            var added = new List<CoreWebView2ContextMenuItem>();
-
-            if (!string.IsNullOrEmpty(link))
+            menu.Add("在新标签页中打开链接", () => _tabs?.NewTab(link));
+            menu.Add("在新窗口中打开链接", () =>
             {
-                added.Add(MakeMenuItem("在新标签页中打开链接", () =>
-                {
-                    if (IsHandleCreated)
-                    {
-                        BeginInvoke(() => _tabs?.NewTab(link));
-                    }
-                }));
-                added.Add(MakeMenuItem("在新窗口中打开链接", () =>
-                {
-                    if (IsHandleCreated)
-                    {
-                        BeginInvoke(() =>
-                        {
-                            var window = new MainForm(link, incognito: false);
-                            window.Show(this);
-                        });
-                    }
-                }));
-                added.Add(MakeMenuItem("复制链接地址", () =>
-                {
-                    if (IsHandleCreated)
-                    {
-                        BeginInvoke(() => CopyToClipboard(link, "已复制链接地址"));
-                    }
-                }));
-            }
-            else if (!string.IsNullOrEmpty(selection))
-            {
-                string text = selection.Trim();
-                if (text.Length <= 60 && !text.Contains('\n'))
-                {
-                    added.Add(MakeMenuItem($"用 {_settings.Engine.Name} 搜索「{Shorten(text)}」", () =>
-                    {
-                        if (IsHandleCreated)
-                        {
-                            BeginInvoke(() => _tabs?.NewTab(
-                                _settings.Engine.Template.Replace("%s",
-                                    Uri.EscapeDataString(text))));
-                        }
-                    }));
-                }
-                added.Add(MakeMenuItem("复制选中文字", () =>
-                {
-                    if (IsHandleCreated)
-                    {
-                        BeginInvoke(() => CopyToClipboard(selection, "已复制选中文字"));
-                    }
-                }));
-            }
-
-            if (added.Count == 0)
-            {
-                return;
-            }
-
-            // 前面插一条分隔线，视觉上和内核自带项分开
-            var separator = tab.View.CoreWebView2.Environment
-                .CreateContextMenuItem("轻羽", null, CoreWebView2ContextMenuItemKind.Separator);
-            menu.Add(separator);
-            foreach (CoreWebView2ContextMenuItem item in added)
-            {
-                menu.Add(item);
-            }
+                var window = new MainForm(link, incognito: false);
+                if (Program.Windows != null) Program.Windows.OpenWindow(window);
+                else window.Show();
+            });
+            menu.Add("复制链接地址", () => CopyToClipboard(link, "已复制链接地址"));
         }
-        catch (Exception ex)
+        else if (!string.IsNullOrWhiteSpace(selection))
         {
-            Log.Warn("构建右键菜单失败: " + ex.Message);
+            string text = selection.Trim();
+            if (text.Length <= 60 && !text.Contains('\n'))
+                menu.Add($"用 {_settings.Engine.Name} 搜索「{Shorten(text)}」",
+                    () => _tabs?.NewTab(_settings.Engine.Template.Replace("%s", Uri.EscapeDataString(text))));
+            menu.Add("复制选中文字", () => CopyToClipboard(selection, "已复制选中文字"));
         }
     }
-
-    private CoreWebView2ContextMenuItem MakeMenuItem(string label, Action action)
-    {
-        CoreWebView2ContextMenuItem item = _tabs.Active.View.CoreWebView2.Environment
-            .CreateContextMenuItem(label, null, CoreWebView2ContextMenuItemKind.Command);
-        item.CustomItemSelected += (_, _) =>
-        {
-            try
-            {
-                action();
-            }
-            catch (Exception ex)
-            {
-                Log.Warn("右键菜单动作失败: " + ex.Message);
-            }
-        };
-        return item;
-    }
-
     private static string Shorten(string text) =>
         text.Length <= 18 ? text : text[..18] + "…";
 
@@ -1685,7 +1604,7 @@ internal sealed class MainForm : Form
     /// <summary>
     /// 新开一个浏览器窗口（同进程）。
     ///
-    /// <para>刻意不用「再启动一个 exe」的办法：那样会各自建一套 WebView2 环境，
+    /// <para>刻意不用「再启动一个 exe」的办法：那样会各自建一套 CEF 环境，
     /// 磁盘缓存与 Cookie 分裂，内存也直接翻倍。同进程多窗口共用环境与数据存储，
     /// 在任务管理器里也更容易看总量。</para>
     /// </summary>
@@ -1772,9 +1691,9 @@ internal sealed class MainForm : Form
             {
                 try
                 {
-                    if (tab.View?.CoreWebView2 != null)
+                    if (tab.View?.Engine != null)
                     {
-                        tab.View.CoreWebView2.Settings.IsScriptEnabled = _settings.JavaScriptEnabled || UrlUtils.IsInternal(tab.Url);
+                        tab.View.Engine.Settings.IsScriptEnabled = _settings.JavaScriptEnabled;
                     }
                 }
                 catch
@@ -1818,7 +1737,7 @@ internal sealed class MainForm : Form
         _tabs.ReclaimNow();
         MemoryMonitor.Refresh();
         UpdateMemoryReadout();
-        SetStatus($"已回收后台标签内存（当前 {MemoryMonitor.Mb(MemoryMonitor.WebViewWorkingSet)}）");
+        SetStatus($"已回收后台标签内存（当前 {MemoryMonitor.Mb(MemoryMonitor.KernelWorkingSet)}）");
     }
 
     // ================================================================ 密码与导入
@@ -1908,31 +1827,20 @@ internal sealed class MainForm : Form
         SetStatus($"密码库现有 {_passwords.Count} 条记录");
     }
 
-    private void ClearCache()
+    private async void ClearCache()
     {
+        var view = _tabs?.Active?.View;
+        if (view?.Engine == null) return;
         try
         {
-            string folder = AppPaths.WebViewDataFolder;
-            if (Directory.Exists(folder))
-            {
-                // 只删缓存目录，保留登录状态所需的 Cookie 数据库
-                foreach (string sub in new[] { "EBWebView\\Default\\Cache", "Default\\Cache", "Cache" })
-                {
-                    string path = Path.Combine(folder, sub);
-                    if (Directory.Exists(path))
-                    {
-                        Directory.Delete(path, true);
-                    }
-                }
-            }
-            SetStatus("缓存已清除");
+            using var client = view.GetDevToolsClient();
+            await client.Network.ClearBrowserCacheAsync();
+            using var cookies = view.RequestContext.GetCookieManager(null);
+            await cookies.DeleteCookiesAsync("", "");
+            SetStatus("缓存与 Cookie 已清除");
         }
-        catch (Exception ex)
-        {
-            SetStatus("清除缓存失败：" + ex.Message);
-        }
+        catch (Exception ex) { SetStatus("清除缓存失败：" + ex.Message); }
     }
-
     private void ShowMemoryDialog()
     {
         if (_tabs == null)
@@ -1973,7 +1881,7 @@ internal sealed class MainForm : Form
         MessageBox.Show(this,
             $"轻羽浏览器 {Application.ProductVersion.Split('+')[0]}\r\n\r\n" +
             "Windows 原生浏览器，界面参考安卓端 Via 浏览器的极简形态。\r\n" +
-            "内核：系统自带的 Microsoft Edge WebView2 运行时（不额外打包 Chromium）。\r\n\r\n" +
+            "内核：内置 CEF Chromium；子进程使用轻羽自己的程序。\r\n\r\n" +
             "低内存做法：\r\n" +
             "  · 标签分档：渲染中 / 已休眠，只有渲染中的标签占内存\r\n" +
             "  · 超出「同时渲染标签数」的标签自动销毁渲染进程，只保留网址\r\n" +
@@ -2145,6 +2053,10 @@ internal sealed class MainForm : Form
             {
                 HideFindBar();
             }
+            else if (_sidebarShown)
+            {
+                ToggleSidebar();
+            }
             else
             {
                 _tabs?.Active?.Stop();
@@ -2252,7 +2164,9 @@ internal sealed class MainForm : Form
 
     private void OnFormClosingHandler(object sender, FormClosingEventArgs e)
     {
-        if (e.Cancel || _closing) return;
+        if (e.Cancel) return;
+        if (_closing) { e.Cancel = !CleanupTask.IsCompleted; return; }
+        e.Cancel = true;
         _closing = true;
         _memoryTimer?.Stop();
         _progressTimer?.Stop();
@@ -2273,11 +2187,17 @@ internal sealed class MainForm : Form
             _tabs.Shutdown();
         }
 
-        if (_incognito && !string.IsNullOrEmpty(_temporaryDataFolder))
-        {
-            // 无痕窗口：删掉整个临时数据目录
-            CleanupTask = CleanupIncognitoAsync();
-        }
+        CleanupTask = CleanupBrowserAsync();
+    }
+
+    private async Task CleanupBrowserAsync()
+    {
+        await Task.Yield();
+        await _startupTask;
+        if (_tabs != null) await _tabs.WaitForViewsDisposedAsync();
+        if (_incognito && !string.IsNullOrEmpty(_temporaryDataFolder)) await CleanupIncognitoAsync();
+        // 下一条界面消息关闭窗口，确保 CleanupTask 已完成，父 HWND 可以安全销毁。
+        if (!IsDisposed) BeginInvoke(() => Close());
     }
 
     /// <summary>

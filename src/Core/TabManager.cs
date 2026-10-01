@@ -1,19 +1,19 @@
 using FeatherBrowser.Services;
-using Microsoft.Web.WebView2.Core;
-using Microsoft.Web.WebView2.WinForms;
+using CefSharp;
+
 
 namespace FeatherBrowser.Core;
 
 /// <summary>
-/// 标签集合与 WebView2 生命周期调度器 —— 整个浏览器「省内存」的落点。
+/// 标签集合与 BrowserView 生命周期调度器 —— 整个浏览器「省内存」的落点。
 ///
 /// <p>它维持两条不变量：
 /// <list type="number">
 ///   <item>处于「渲染中」的标签数不超过 <see cref="AppSettings.MaxLiveTabs"/>；</item>
-///   <item>当前标签一定是渲染中的那一个，且它的 WebView2 挂在可见容器里。</item>
+///   <item>当前标签一定是渲染中的那一个，且它的 BrowserView 挂在可见容器里。</item>
 /// </list>
 ///
-/// <p>超出上限的标签会被休眠（销毁 WebView2、渲染进程退出），但标签对象与网址都保留，
+/// <p>超出上限的标签会被休眠（销毁 BrowserView、渲染进程退出），但标签对象与网址都保留，
 /// 因此随着标签数量增长，常驻内存收敛到一个常数而不是线性增长。
 /// </summary>
 public sealed class TabManager
@@ -23,7 +23,9 @@ public sealed class TabManager
     private readonly Panel _parking;
     private readonly Control _uiInvoker;
     private readonly BrowserContext _context;
-    private CoreWebView2Environment _environment;
+    private BrowserProfile _environment;
+    private readonly HashSet<BrowserView> _views = new();
+    internal Task WaitForViewsDisposedAsync() => Task.WhenAll(_views.Select(v => v.DisposalTask));
     private bool _suspendedAll;
     private bool _activating;
     private bool _shutdown;
@@ -61,7 +63,7 @@ public sealed class TabManager
     /// 网页右键被按下，宿主可以往菜单里补充自己的项。
     /// 参数：标签、内核给的菜单对象、以及该位置的上下文信息。
     /// </summary>
-    public event Action<BrowserTab, CoreWebView2ContextMenuRequestedEventArgs>
+    public event Action<BrowserTab, BrowserContextMenu>
         ContextMenuRequested;
 
     /// <summary>需要询问用户是否保存登录凭据时触发（账号, 密码）。</summary>
@@ -194,114 +196,35 @@ public sealed class TabManager
     }
 
     /// <summary>
-    /// 创建一个 WebView2 环境。
+    /// 创建一个 CEF 请求上下文。
     ///
     /// <para>抽成静态方法是为了让多窗口共用：普通窗口都拿 <see cref="BrowserContext"/>
-    /// 里的同一个环境，只有无痕窗口才单独建一个（它需要独立的临时数据目录）。</para>
+    /// 里的同一个环境，只有无痕窗口才单独建一个（它使用独立的内存 Cookie 与缓存）。</para>
     /// </summary>
-    public static async Task<CoreWebView2Environment> CreateEnvironmentAsync(
-        string userDataFolder, bool forceDarkPages)
+    internal static async Task<BrowserProfile> CreateEnvironmentAsync(string userDataFolder, bool forceDarkPages,
+        bool isPrivate = false)
     {
-        var options = new CoreWebView2EnvironmentOptions(
-            "--disable-features=msWebOOUI,msPdfOOUI " +
-            // 让内核子进程继承本程序的身份，任务管理器里才会归到「轻羽浏览器」名下，
-            // 而不是显示成一堆 msedgewebview2
-            $"--app-user-model-id={AppIdentity.AppUserModelId}")
-        {
-            Language = "zh-CN",
-        };
-
-        // 深色主题：让内核把网页也按深色渲染（Chromium 的自动深色模式）。
-        // 这是内核启动参数，只能在创建环境时给，运行中改主题需要重建环境。
-        if (forceDarkPages)
-        {
-            options.AdditionalBrowserArguments += " --enable-features=WebContentsForceDark";
-        }
-
-        // 关于自定义 scheme（记录一个踩过的坑）：
-        // 曾想用 CoreWebView2CustomSchemeRegistration 把 feather.local 声明成安全 scheme，
-        // 但这个 SDK 版本上 options.CustomSchemeRegistrations 是只读属性且**默认是 null**，
-        // 调 Add 必抛 NullReference，也无法给它赋值（编译不过）。
-        // 实测不需要它：SetVirtualHostNameToFolderMapping + https:// 前缀的虚拟主机
-        // 本身就能正常加载页面（已用 ExecuteScriptAsync 取页面文本验证过）。
-
-        var environment = await CoreWebView2Environment.CreateAsync(
-            browserExecutableFolder: null,
-            userDataFolder: userDataFolder,
-            options: options);
-
-        Log.Info($"WebView2 环境就绪，用户数据目录: {userDataFolder}");
-        return environment;
+        var profile = new BrowserProfile(isPrivate ? "" : userDataFolder, isPrivate);
+        await profile.Ready.WaitAsync(TimeSpan.FromSeconds(30));
+        return profile;
     }
 
-    /// <summary>
-    /// 把内置管理页的虚拟主机指到磁盘上的页面目录。
-    /// 映射是实例级的（不是环境级），所以每个 WebView2 都要设一次。
-    /// </summary>
-    internal static void MapInternalPages(CoreWebView2 core)
-    {
-        try
-        {
-            string folder = InternalPages.Folder;
-            Directory.CreateDirectory(folder);
-            core.SetVirtualHostNameToFolderMapping(
-                InternalPages.Host, folder, CoreWebView2HostResourceAccessKind.DenyCors);
-        }
-        catch (Exception ex)
-        {
-            Log.Warn("映射内置页面目录失败: " + ex.Message);
-        }
-    }
-
-    /// <summary>
-    /// 取得本窗口要用的 WebView2 环境。
-    ///
-    /// <para>普通窗口从 <see cref="BrowserContext"/> 拿共用环境（缓存与 Cookie 不分裂）；
-    /// 无痕窗口用自己独立的环境与临时目录。</para>
-    /// </summary>
     public async Task InitializeAsync()
     {
-        if (_shutdown) return;
-        if (_environment != null)
-        {
-            return;
-        }
-
-        if (IsIncognito && !string.IsNullOrEmpty(TemporaryDataFolder))
-        {
-            _environment = await CreateEnvironmentAsync(TemporaryDataFolder, PageTheme.ForceDark);
-        }
-        else
-        {
-            _environment = await _context.GetEnvironmentAsync(PageTheme.ForceDark);
-        }
-        if (!_shutdown) MemoryMonitor.RegisterEnvironment(_environment);
+        if (_shutdown || _environment != null) return;
+        _environment = IsIncognito
+            ? await CreateEnvironmentAsync("", PageTheme.ForceDark, isPrivate: true)
+            : await _context.GetEnvironmentAsync(PageTheme.ForceDark);
     }
 
-    /// <summary>
-    /// 主题切换后更新网页区域。
-    ///
-    /// <p>底色可以立刻生效；「强制深色」是内核启动参数、不可热改，
-    /// 这里退一步用 Profile.PreferredColorScheme 影响站点自身配色，
-    /// 已有页面刷新后观感基本一致。
-    /// </summary>
     public void UpdatePageTheme(int backgroundArgb, bool forceDark)
     {
-        PageTheme = new PageTheme
-        {
-            BackgroundArgb = backgroundArgb,
-            ForceDark = forceDark,
-        };
-
-        foreach (BrowserTab tab in _tabs)
-        {
-            tab.ApplyThemeToView();
-        }
+        PageTheme = new PageTheme { BackgroundArgb = backgroundArgb, ForceDark = forceDark };
+        foreach (BrowserTab tab in _tabs) tab.ApplyThemeToView();
     }
-
     public bool IsReady => _environment != null;
 
-    internal CoreWebView2Environment Environment => _environment;
+    internal BrowserProfile Environment => _environment;
 
     // ---------------------------------------------------------------- 标签操作
 
@@ -377,15 +300,14 @@ public sealed class TabManager
                 }
                 if (other.View.Parent == _viewHost)
                 {
-                    _viewHost.Controls.Remove(other.View);
-                    _parking.Controls.Add(other.View);
+                    other.View.Visible = false;
                 }
             }
 
             // 在创建之前腾出预算，快速切换期间也不额外驻留视图。
             EnforceMemoryPolicy();
 
-            // 创建/唤起 WebView2。这里是异步的（要等内核就绪），
+            // 创建/唤起 BrowserView。这里是异步的（要等内核就绪），
             // 因此不 await：界面先切过去，页面在几十毫秒后开始加载。
             bool needCreate = tab.View == null;
             if (needCreate || tab.Life == TabLife.Cold)
@@ -394,13 +316,9 @@ public sealed class TabManager
             }
             else
             {
-                WebView2 view = tab.View;
+                BrowserView view = tab.View;
                 if (view.Parent != _viewHost)
                 {
-                    if (view.Parent is Control parent)
-                    {
-                        parent.Controls.Remove(view);
-                    }
                     _viewHost.Controls.Add(view);
                 }
                 view.BringToFront();
@@ -495,7 +413,7 @@ public sealed class TabManager
     ///
     /// <p>只保留两档，故意不用 TrySuspendAsync 做中间态：实测它要求视图处于不可见状态
     /// 才会成功，用在「标签数超限」这种场景失败率很高，而一次失败就意味着上限形同虚设。
-    /// 所以这里只做确定的事 —— 超出上限的标签把 WebView2 整个销毁，渲染进程退出、
+    /// 所以这里只做确定的事 —— 超出上限的标签把 BrowserView 整个销毁，渲染进程退出、
     /// 内存真正归还；标签本身和网址都留着，切回去按 URL 重新加载。
     ///
     /// <p>算法是「填桶」：当前标签先占一个名额，剩下的按最近使用时间从新到旧填，填满即停。
@@ -615,12 +533,12 @@ public sealed class TabManager
         TabsChanged?.Invoke();
     }
 
-    /// <summary>WebView2 环境的释放由窗口负责；这里只销毁各标签的控件。</summary>
+    /// <summary>CEF 请求上下文的释放由窗口负责；这里只销毁各标签的控件。</summary>
     public void Shutdown()
     {
         if (_shutdown) return;
         _shutdown = true;
-        if (_environment != null) MemoryMonitor.UnregisterEnvironment(_environment);
+
         foreach (BrowserTab tab in _tabs)
         {
             tab.Dispose();
@@ -629,119 +547,27 @@ public sealed class TabManager
         ActiveIndex = -1;
     }
 
-    internal async Task ReleasePrivateEnvironmentAsync()
+    internal Task ReleasePrivateEnvironmentAsync()
     {
-        if (!IsIncognito || _environment == null) return;
-        var exited = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        uint browserId = 0;
-        void OnExited(object sender, CoreWebView2BrowserProcessExitedEventArgs e)
-        {
-            if (e.BrowserProcessId == browserId) exited.TrySetResult();
-        }
-        _environment.BrowserProcessExited += OnExited;
-        try
-        {
-            // 关闭发生在环境初始化期间时，还没有控制器可以关闭。
-            // 建一个空控制器再关闭，使该私有环境的浏览器进程完成正常退出。
-            using var host = new Control();
-            var controller = await _environment.CreateCoreWebView2ControllerAsync(host.Handle);
-            browserId = controller.CoreWebView2.BrowserProcessId;
-            controller.Close();
-            await exited.Task.WaitAsync(TimeSpan.FromSeconds(10));
-        }
-        catch (Exception ex)
-        {
-            Log.Warn("等待无痕内核退出失败: " + ex.Message);
-        }
-        finally
-        {
-            _environment.BrowserProcessExited -= OnExited;
-            _environment = null;
-        }
+        if (IsIncognito) { _environment?.Dispose(); _environment = null; }
+        return Task.CompletedTask;
     }
 
-    // ---------------------------------------------------------------- 视图创建
-
-    /// <summary>为一个标签创建 WebView2 控件（此时还没初始化内核，也还没导航）。</summary>
-    internal WebView2 CreateViewFor(BrowserTab tab)
+    internal BrowserView CreateViewFor(BrowserTab tab)
     {
-        if (_environment == null)
-        {
-            throw new InvalidOperationException("WebView2 环境尚未初始化完成");
-        }
-
-        return new WebView2
-        {
-            Dock = DockStyle.Fill,
-        };
+        if (_environment == null) throw new InvalidOperationException("CEF 环境尚未就绪");
+        var view = new BrowserView(_environment, this, tab);
+        _views.Add(view);
+        view.Disposed += (_, _) => _views.Remove(view);
+        return view;
     }
 
-    /// <summary>
-    /// 初始化某个标签的 WebView2 内核，然后套用设置并绑定事件。
-    /// 用 <c>EnsureCoreWebView2Async</c> 而不是让控件自己隐式初始化，
-    /// 这样能明确知道「内核什么时候可用」，避免导航发生在初始化之前。
-    /// </summary>
-    internal async Task<CoreWebView2> EnsureCoreAsync(WebView2 view, BrowserTab tab)
+    internal async Task<BrowserView> EnsureCoreAsync(BrowserView view, BrowserTab tab)
     {
-        CoreWebView2ControllerOptions options = null;
-        if (IsIncognito)
-        {
-            options = _environment.CreateCoreWebView2ControllerOptions();
-            options.IsInPrivateModeEnabled = true;
-        }
-        await view.EnsureCoreWebView2Async(_environment, options);
-        if (_shutdown || !tab.OwnsView(view)) return null;
-        CoreWebView2 core = view.CoreWebView2;
-        ApplyCoreSettings(core, tab);
-        tab.BindCoreEvents(core);
-        return core;
+        tab.BindCoreEvents(view);
+        await view.InitializeAsync();
+        return !_shutdown && tab.OwnsView(view) ? view.Engine : null;
     }
-
-    /// <summary>把用户设置套用到内核上。</summary>
-    private void ApplyCoreSettings(CoreWebView2 core, BrowserTab tab)
-    {
-        try
-        {
-            var s = core.Settings;
-            s.IsScriptEnabled = Settings.JavaScriptEnabled || UrlUtils.IsInternal(tab.Url);
-            s.AreDefaultScriptDialogsEnabled = true;
-            // 自动填充要用 WebMessage 和页面通信（页面把用户点选的账号、
-            // 以及提交时的输入值发回来），所以必须打开
-            s.IsWebMessageEnabled = true;
-            s.AreDefaultContextMenusEnabled = true;
-            s.AreDevToolsEnabled = false;
-            s.IsStatusBarEnabled = false;
-            s.IsZoomControlEnabled = true;
-            s.IsBuiltInErrorPageEnabled = true;
-            s.IsPasswordAutosaveEnabled = false;
-            s.IsGeneralAutofillEnabled = Settings.PasswordAutofill && !IsIncognito;
-            s.IsPinchZoomEnabled = true;
-            // 省内存：把「预渲染」与「后台挂起」策略交给 WebView2 自己管
-            s.IsSwipeNavigationEnabled = false;
-            s.IsReputationCheckingRequired = true;
-            s.IsNonClientRegionSupportEnabled = false;
-
-            core.Profile.PreferredColorScheme = CoreWebView2PreferredColorScheme.Light;
-        }
-        catch (Exception ex)
-        {
-            Log.Warn("应用内核设置失败: " + ex.Message);
-        }
-
-        try
-        {
-            // 无痕：内核级别关闭磁盘缓存写入
-            if (IsIncognito && core.Profile != null)
-            {
-                // 无痕窗口使用独立的用户数据目录，本身就不会留下痕迹
-            }
-        }
-        catch
-        {
-            // 忽略
-        }
-    }
-
     // ---------------------------------------------------------------- 事件转发
 
     internal void NotifyNavigationStarting(BrowserTab tab, string uri)
@@ -794,7 +620,7 @@ public sealed class TabManager
     /// </summary>
     internal void InjectLoginHelper(BrowserTab tab)
     {
-        if (tab == null || IsIncognito || tab.View?.CoreWebView2 == null)
+        if (tab == null || IsIncognito || tab.View?.Engine == null)
         {
             return;
         }
@@ -805,7 +631,7 @@ public sealed class TabManager
 
         try
         {
-            string source = tab.View.CoreWebView2.Source;
+            string source = tab.View.Engine.Source;
             if (source == tab.CredentialSource && tab.CredentialPickToken != null) return;
             var matches = Passwords.FindForUrl(source);
             var accounts = matches
@@ -820,7 +646,7 @@ public sealed class TabManager
             }
             tab.CredentialSource = source;
             tab.CredentialPickToken = token;
-            _ = tab.View.CoreWebView2.ExecuteScriptAsync(
+            _ = tab.View.Engine.ExecuteScriptAsync(
                 "if(window.location.href===" + JsQuote(source) + "){" + script + "}");
         }
         catch (Exception ex)
@@ -832,7 +658,7 @@ public sealed class TabManager
     /// <summary>用户在页面的账号下拉里选了某一项。</summary>
     internal void NotifyCredentialPicked(BrowserTab tab, string accountId)
     {
-        if (IsIncognito || !Settings.PasswordAutofill || tab?.View?.CoreWebView2 == null)
+        if (IsIncognito || !Settings.PasswordAutofill || tab?.View?.Engine == null)
         {
             return;
         }
@@ -840,7 +666,7 @@ public sealed class TabManager
         try
         {
             string source = tab.CredentialSource;
-            if (string.IsNullOrEmpty(source) || source != tab.View.CoreWebView2.Source) return;
+            if (string.IsNullOrEmpty(source) || source != tab.View.Engine.Source) return;
             var matches = Passwords.FindForUrl(tab.Url);
             PasswordEntry target = matches.FirstOrDefault(e =>
                 string.Equals(e.Username + "\u0001" + e.Domain, accountId, StringComparison.Ordinal));
@@ -862,7 +688,7 @@ public sealed class TabManager
                 "if(window.location.href===" + JsQuote(source) + "){" +
                 "window.__featherFillPassword&&window.__featherFillPassword(" +
                 JsQuote(target.Username) + "," + JsQuote(password) + ");}";
-            _ = tab.View.CoreWebView2.ExecuteScriptAsync(script);
+            _ = tab.View.Engine.ExecuteScriptAsync(script);
         }
         catch (Exception ex)
         {
@@ -933,7 +759,7 @@ public sealed class TabManager
     internal void NotifyWindowCloseRequested(BrowserTab tab) => CloseTab(tab);
 
     internal void NotifyContextMenuRequested(BrowserTab tab,
-        CoreWebView2ContextMenuRequestedEventArgs e) =>
+        BrowserContextMenu e) =>
         ContextMenuRequested?.Invoke(tab, e);
 
     /// <summary>内置管理页发来的消息（JSON）。宿主负责解析与响应。</summary>
@@ -952,17 +778,17 @@ public sealed class TabManager
     {
         try
         {
-            WebView2 view = tab?.View;
-            if (view?.CoreWebView2 == null || !InternalPages.Handles(view.CoreWebView2.Source))
+            BrowserView view = tab?.View;
+            if (view?.Engine == null || !InternalPages.Handles(view.Engine.Source))
             {
                 Log.Warn("推数据给内置页失败：视图还没就绪");
                 return;
             }
-            string source = view.CoreWebView2.Source;
+            string source = view.Engine.Source;
             string script = "if(window.location.href===" + JsQuote(source) + ")" +
                 $"{{window.featherUpdate({json});}}";
             Log.Info($"推数据给内置页: {json.Length} 字节 JSON");
-            await view.CoreWebView2.ExecuteScriptAsync(script);
+            await view.Engine.ExecuteScriptAsync(script);
         }
         catch (Exception ex)
         {
@@ -976,56 +802,7 @@ public sealed class TabManager
     /// <para>只记录状态，不接管字节流：内核会按浏览器默认行为把文件写进下载目录，
     /// 我们订阅它的进度回调更新记录。这样大文件不会多一次拷贝。</para>
     /// </summary>
-    internal void HandleDownloadStarting(CoreWebView2DownloadStartingEventArgs e)
-    {
-        try
-        {
-            CoreWebView2DownloadOperation op = e.DownloadOperation;
-            string fileName = "未命名文件";
-            try
-            {
-                string fromUri = Path.GetFileName(new Uri(op.Uri).LocalPath);
-                if (!string.IsNullOrWhiteSpace(fromUri))
-                {
-                    fileName = Uri.UnescapeDataString(fromUri);
-                }
-            }
-            catch
-            {
-                // Uri 解析失败就用兜底名字
-            }
-
-            DownloadItem item = Downloads.Begin(op.Uri, fileName);
-            Log.Info($"开始下载: {fileName} <- {op.Uri}");
-
-            op.BytesReceivedChanged += (_, _) =>
-                Downloads.UpdateProgress(item, (long)op.BytesReceived, (long)op.TotalBytesToReceive);
-
-            op.StateChanged += (_, _) =>
-            {
-                switch (op.State)
-                {
-                    case CoreWebView2DownloadState.Completed:
-                        Downloads.Complete(item, op.ResultFilePath,
-                            (long)op.TotalBytesToReceive);
-                        Log.Info($"下载完成: {op.ResultFilePath}");
-                        DownloadsChanged?.Invoke();
-                        break;
-                    case CoreWebView2DownloadState.Interrupted:
-                        Downloads.Fail(item, op.InterruptReason.ToString());
-                        Log.Warn($"下载中断: {item.FileName} / {op.InterruptReason}");
-                        DownloadsChanged?.Invoke();
-                        break;
-                }
-            };
-
-            DownloadsChanged?.Invoke();
-        }
-        catch (Exception ex)
-        {
-            Log.Warn("处理下载开始事件失败: " + ex.Message);
-        }
-    }
+    internal void NotifyDownloadsChanged() => DownloadsChanged?.Invoke();
 
     /// <summary>下载状态有变化（开始 / 完成 / 中断），宿主可据此刷新下载页。</summary>
     public event Action DownloadsChanged;
@@ -1033,7 +810,7 @@ public sealed class TabManager
     /// <summary>
     /// 某个标签的内核进程异常退出。
     ///
-    /// <p>不能静默忽略：这时标签持有的 WebView2 已经失效，用户看到的会是白屏或卡死。
+    /// <p>不能静默忽略：这时标签持有的 BrowserView 已经失效，用户看到的会是白屏或卡死。
     /// 处理办法是把受影响的标签降为冷态（丢掉失效引用）再按需重建。
     ///
     /// <p>两种情况要区别对待：

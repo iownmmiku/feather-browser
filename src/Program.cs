@@ -10,6 +10,14 @@ internal static class Program
     [STAThread]
     private static void Main(string[] args)
     {
+        int subprocessExit = CefSharp.BrowserSubprocess.SelfHost.Main(args);
+        if (subprocessExit >= 0) { Environment.ExitCode = subprocessExit; return; }
+        RunBrowser(args);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static void RunBrowser(string[] args)
+    {
         // 数据目录覆盖必须在任何 AppPaths.Root 访问之前生效
         bool dataDirectorySpecified = false;
         foreach (string arg in args)
@@ -38,7 +46,8 @@ internal static class Program
             string output = args.Length > 1
                 ? args[1]
                 : Path.Combine(AppPaths.Root, "selftest.txt");
-            SelfTest.RunAsync(output).GetAwaiter().GetResult();
+            try { SelfTest.RunAsync(output).GetAwaiter().GetResult(); }
+            finally { BrowserRuntime.Shutdown(); }
             return;
         }
 
@@ -70,8 +79,8 @@ internal static class Program
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
 
-        // 登记程序身份：让任务管理器/任务栏显示「轻羽浏览器」，
-        // 而不是把网页子进程显示成 msedgewebview2 或「WebView2」。
+        // 登记稳定的任务栏身份及「轻羽浏览器」显示名。
+        // Chromium 子进程也使用同一个 FeatherBrowser.exe。
         AppIdentity.Initialize(null);
 
         Application.ThreadException += (_, e) =>
@@ -108,10 +117,19 @@ internal static class Program
             startUrl ??= candidate;
         }
 
+        using var instance = new SingleInstance(AppPaths.Root);
+        if (!instance.IsOwner)
+        {
+            try { instance.ForwardAsync(startUrl).GetAwaiter().GetResult(); }
+            catch (Exception ex) { Log.Error("无法通知已运行的浏览器", ex); }
+            return;
+        }
         using var form = new MainForm(startUrl, incognito: false, themeOverride, uiTest);
         using var windows = new BrowserApplicationContext();
         Windows = windows;
         windows.OpenWindow(form);
-        Application.Run(windows);
+        instance.Listen(windows.RequestWindow);
+        try { Application.Run(windows); }
+        finally { BrowserRuntime.Shutdown(); }
     }
 }

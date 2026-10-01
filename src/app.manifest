@@ -4,7 +4,7 @@
 
   <application xmlns="urn:schemas-microsoft-com:asm.v3">
     <windowsSettings>
-      <!-- 高分屏清晰度：按显示器 DPI 感知，避免 WebView2 模糊 -->
+      <!-- 高分屏清晰度：按显示器 DPI 感知，避免 网页模糊 -->
       <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
       <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true</dpiAware>
     </windowsSettings>

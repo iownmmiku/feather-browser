@@ -1,12 +1,7 @@
-﻿; 轻羽浏览器 Windows 安装程序（NSIS 3）
+; 轻羽浏览器 Windows 安装程序（NSIS 3）
 ;
-; 设计要点：
-;   1. 打包的是自包含发布目录，用户不需要预装 .NET。
-;   2. 本项目复用系统 WebView2 运行时，只做「检测 + 引导下载」：
-;      附带经微软签名验证的引导程序，缺失时询问用户，同意再联网安装内核。
-;   3. 应用数据在 %LOCALAPPDATA%\FeatherBrowser，卸载时询问是否一并删除。
-;   4. 用固态 LZMA 压缩，162 MB 的目录压出来大约几十 MB。
-
+; 内置 .NET 与 CEF Chromium，VC++ 依赖离线安装。
+; 用户数据默认保留，卸载仅移除已打包文件。
 Unicode true
 SetCompressor /SOLID lzma
 SetCompressorDictSize 64
@@ -29,8 +24,8 @@ SetCompressorDictSize 64
 !ifndef OUT_DIR
   !define OUT_DIR "..\dist"
 !endif
-!ifndef WEBVIEW2_BOOTSTRAPPER
-  !define WEBVIEW2_BOOTSTRAPPER "${OUT_DIR}\build-tools\MicrosoftEdgeWebview2Setup.exe"
+!ifndef VC_REDIST
+  !define VC_REDIST "${OUT_DIR}\build-tools\vc_redist.x64.exe"
 !endif
 
 !define PRODUCT_NAME "轻羽浏览器"
@@ -87,22 +82,6 @@ Function .onInit
   SetRegView 64
 FunctionEnd
 
-Function CheckWebView2
-  ; WebView2 运行时版本号写在两个位置：机器级与用户级，任一存在即可
-  ClearErrors
-  ReadRegStr $0 HKLM "SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}" "pv"
-  ${If} $0 == "0.0.0.0"
-    StrCpy $0 ""
-  ${EndIf}
-  ${If} $0 == ""
-    ReadRegStr $0 HKCU "SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}" "pv"
-  ${EndIf}
-  ${If} $0 == "0.0.0.0"
-    StrCpy $0 ""
-  ${EndIf}
-  Push $0
-FunctionEnd
-
 Section "主程序" SecMain
   SectionIn RO
   SetOutPath "$INSTDIR"
@@ -139,48 +118,35 @@ Section "主程序" SecMain
   WriteRegDWORD HKLM "${UNINST_KEY}" "EstimatedSize" "$0"
 SectionEnd
 
-Section "WebView2 内核运行时检测" SecWebView2
+Section "VC++ 运行库" SecRuntime
   SectionIn RO
-  Call CheckWebView2
-  Pop $0
-
-  ${If} $0 != ""
-    DetailPrint "已检测到 WebView2 运行时：$0"
+  ReadRegDWORD $0 HKLM "SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64" "Installed"
+  ReadRegDWORD $1 HKLM "SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64" "Minor"
+  ${If} $0 == 1
+  ${AndIf} $1 >= 44
+    DetailPrint "已检测到兼容的 VC++ x64 运行库"
   ${Else}
-    DetailPrint "未检测到 WebView2 运行时"
-    MessageBox MB_ICONEXCLAMATION|MB_YESNO \
-      "本程序需要「Microsoft Edge WebView2 运行时」才能显示网页，但当前系统未安装。$\r$\n$\r$\n\
-       是否现在通过微软引导程序下载并安装运行时？（需要联网）$\r$\n$\r$\n\
-       选择「否」也可以先完成安装，之后自行到微软官网下载安装。" \
-      /SD IDNO IDNO SkipWebView2
-
     InitPluginsDir
     SetOutPath "$PLUGINSDIR"
-    File /oname=MicrosoftEdgeWebview2Setup.exe "${WEBVIEW2_BOOTSTRAPPER}"
-    DetailPrint "正在安装 WebView2 运行时（静默）…"
+    File /oname=vc_redist.x64.exe "${VC_REDIST}"
+    DetailPrint "正在离线安装 VC++ x64 运行库…"
     ClearErrors
-    ExecWait '"$PLUGINSDIR\MicrosoftEdgeWebview2Setup.exe" /silent /install' $2
+    ExecWait '"$PLUGINSDIR\vc_redist.x64.exe" /install /quiet /norestart' $2
     ${If} ${Errors}
-      MessageBox MB_ICONEXCLAMATION|MB_OK \
-        "无法启动 WebView2 引导程序，请稍后从微软官网手动安装运行时。" /SD IDOK
-    ${Else}
-      Call CheckWebView2
-      Pop $0
-      ${If} $0 != ""
-        DetailPrint "WebView2 运行时安装完成：$0"
-      ${Else}
-        MessageBox MB_ICONEXCLAMATION|MB_OK \
-          "未检测到 WebView2 运行时（引导程序返回码 $2）。请稍后从微软官网手动安装：$\r$\n\
-           https://developer.microsoft.com/microsoft-edge/webview2/" /SD IDOK
-      ${EndIf}
+      MessageBox MB_ICONSTOP|MB_OK "无法启动 VC++ 运行库安装程序。" /SD IDOK
+      Abort
     ${EndIf}
-    Delete "$PLUGINSDIR\MicrosoftEdgeWebview2Setup.exe"
+    ${If} $2 == 3010
+      SetRebootFlag true
+    ${ElseIf} $2 != 0
+    ${AndIf} $2 != 1638
+      MessageBox MB_ICONSTOP|MB_OK "VC++ 运行库安装失败，返回码 $2。" /SD IDOK
+      Abort
+    ${EndIf}
+    Delete "$PLUGINSDIR\vc_redist.x64.exe"
     SetOutPath "$INSTDIR"
-
-    SkipWebView2:
   ${EndIf}
 SectionEnd
-
 ; ---------------------------------------------------------------- 卸载
 
 Section "Uninstall"
@@ -189,11 +155,12 @@ Section "Uninstall"
   ; 关掉正在运行的实例，否则文件删不干净
   ExecWait 'taskkill /F /IM ${PRODUCT_EXE} /T' $0
   Sleep 800
-  ; /T 已结束轻羽的子进程；不要按 WebView2 进程名结束其它应用的内核。
+  ; /T 一并结束本程序的 Chromium 子进程。
 
   Delete "$INSTDIR\${PRODUCT_EXE}"
   Delete "$INSTDIR\Uninstall.exe"
-  RMDir /r "$INSTDIR"
+  !include "${UNINSTALL_MANIFEST}"
+  RMDir "$INSTDIR"
 
   Delete "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME}.lnk"
   Delete "$SMPROGRAMS\${PRODUCT_NAME}\卸载 ${PRODUCT_NAME}.lnk"

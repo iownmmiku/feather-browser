@@ -1,12 +1,11 @@
-﻿# 发布自包含版本并打包 Windows 安装程序。
+# 发布自包含版本并打包 Windows 安装程序。
 #
 # 自包含 = 把 .NET 运行时一起带上，用户不需要预装 .NET。
-# 本项目复用系统 WebView2 运行时，只做检测 + 引导安装。
+# 内置 CEF Chromium；离线附带经微软签名验证的 VC++ 运行库。
 param(
     [string]$Version,
     [string]$MakensisPath,
-    [switch]$SkipInstaller,
-    [switch]$Trim
+    [switch]$SkipInstaller
 )
 
 $ErrorActionPreference = 'Stop'
@@ -40,21 +39,13 @@ $publishArgs = @(
     '-r', 'win-x64',
     '--self-contained', 'true',
     '-p:PublishSingleFile=false',
-    # 不做 IL 裁剪：WinForms 与 WebView2 都依赖 COM 封送存根（System.StubHelpers.*），
-    # 裁剪会把它们当成未使用代码删掉，表现为程序能启动、但 WebView2 内核初始化抛
-    # TypeLoadException: Could not load type 'System.StubHelpers.InterfaceMarshaler'。
+    # WinForms 和 C++/CLI 使用动态封送与反射，保留完整运行时。
     '-p:PublishTrimmed=false',
     "-p:Version=$Version",
     "-p:FileVersion=$assemblyVersion",
     "-p:AssemblyVersion=$assemblyVersion",
     '--nologo'
 )
-if ($Trim) {
-    Write-Host "    警告: -Trim 会裁掉 COM 封送存根导致 WebView2 起不来，仅供体积实验" -ForegroundColor Yellow
-    $publishArgs += '-p:PublishTrimmed=true'
-    $publishArgs += '-p:TrimMode=partial'
-    $publishArgs += '-p:_SuppressWinFormsTrimError=true'
-}
 & dotnet @publishArgs
 if ($LASTEXITCODE -ne 0) { throw "dotnet publish 失败，退出码 $LASTEXITCODE" }
 
@@ -77,29 +68,40 @@ if (-not (Test-Path -LiteralPath $makensis)) {
     throw "未找到 NSIS: $makensis。可用 -MakensisPath 指定免安装版编译器。"
 }
 
-# 附带微软的 Evergreen 引导程序，避免安装时用不支持 HTTPS 的 NSISdl 下载。
-# 内核本体仍复用系统环境；只有缺失且用户同意时才由引导程序联网安装。
+# VC++ 运行库随安装包离线提供。
 $buildTools = Join-Path $dist 'build-tools'
 New-Item -ItemType Directory -Force -Path $buildTools | Out-Null
-$bootstrapper = Join-Path $buildTools 'MicrosoftEdgeWebview2Setup.exe'
-Write-Host "==> 获取并验证 WebView2 引导程序" -ForegroundColor Cyan
+$bootstrapper = Join-Path $buildTools 'vc_redist.x64.exe'
+Write-Host "==> 获取并验证 VC++ 运行库" -ForegroundColor Cyan
 $bootstrapperClient = New-Object System.Net.WebClient
 $previousSecurityProtocol = [Net.ServicePointManager]::SecurityProtocol
 try {
     [Net.ServicePointManager]::SecurityProtocol = $previousSecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-    $bootstrapperClient.DownloadFile('https://go.microsoft.com/fwlink/p/?LinkId=2124703', $bootstrapper)
+    $bootstrapperClient.DownloadFile('https://aka.ms/vc14/vc_redist.x64.exe', $bootstrapper)
 } finally {
     $bootstrapperClient.Dispose()
     [Net.ServicePointManager]::SecurityProtocol = $previousSecurityProtocol
 }
 $signature = Get-AuthenticodeSignature -LiteralPath $bootstrapper
 if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch '(^|,\s*)O=Microsoft Corporation(,|$)') {
-    throw 'WebView2 引导程序未通过微软 Authenticode 签名验证，停止打包。'
+    throw 'VC++ 运行库未通过微软 Authenticode 签名验证，停止打包。'
 }
 
+# 卸载只删除当前负载文件与空目录，避免误删安装目录中的其他文件。
+$uninstallManifest = Join-Path $buildTools 'uninstall-files.nsh'
+$uninstallLines = @()
+Get-ChildItem -LiteralPath $pub -Recurse -File | ForEach-Object {
+    $relativeFile = $_.FullName.Substring($pub.Length + 1).Replace('$', '$$').Replace('"', '$\"')
+    $uninstallLines += 'Delete "$INSTDIR\' + $relativeFile + '"'
+}
+Get-ChildItem -LiteralPath $pub -Recurse -Directory | Sort-Object { $_.FullName.Length } -Descending | ForEach-Object {
+    $relativeDirectory = $_.FullName.Substring($pub.Length + 1).Replace('$', '$$').Replace('"', '$\"')
+    $uninstallLines += 'RMDir "$INSTDIR\' + $relativeDirectory + '"'
+}
+[IO.File]::WriteAllLines($uninstallManifest, $uninstallLines, [Text.UTF8Encoding]::new($false))
 Write-Host "==> 编译安装程序" -ForegroundColor Cyan
 $nsi = Join-Path $root 'tools\installer.nsi'
-& $makensis "/DPRODUCT_VERSION=$Version" "/DPRODUCT_FILE_VERSION=$assemblyVersion" "/DSOURCE_DIR=$pub" "/DOUT_DIR=$dist" "/DWEBVIEW2_BOOTSTRAPPER=$bootstrapper" $nsi
+& $makensis "/DPRODUCT_VERSION=$Version" "/DPRODUCT_FILE_VERSION=$assemblyVersion" "/DSOURCE_DIR=$pub" "/DOUT_DIR=$dist" "/DVC_REDIST=$bootstrapper" "/DUNINSTALL_MANIFEST=$uninstallManifest" $nsi
 if ($LASTEXITCODE -ne 0) { throw "makensis 失败，退出码 $LASTEXITCODE" }
 
 Write-Host "==> 完成，产物：" -ForegroundColor Green

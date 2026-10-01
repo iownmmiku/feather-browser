@@ -11,8 +11,8 @@ namespace FeatherBrowser.UI;
 /// 之前的实现想用弹出窗口做标签列表，结果既没接上线，也无法被截图工具抓取核对。
 /// 改成主窗口内的面板后：渲染可控、能被自动截图验证、也不会因为抢焦点被系统关掉。
 ///
-/// <p>侧边栏平时隐藏（宽度收成 0），点标签按钮或按 Ctrl+Shift+T 时展开。
-/// 展开时会把网页容器挡住一部分，这是有意的：看标签时不需要看网页。
+/// <p>侧边栏平时隐藏，点标签按钮或按 Ctrl+Shift+E 时展开。
+/// 展开后与网页并排，不覆盖工具栏、网页或状态栏。
 /// </summary>
 internal sealed class TabsSidebar : Control
 {
@@ -56,6 +56,7 @@ internal sealed class TabsSidebar : Control
         Dock = DockStyle.Right;
         Width = 0;
         Visible = false;
+        TabStop = true;
         Font = Theme.UiFont;
     }
 
@@ -64,6 +65,7 @@ internal sealed class TabsSidebar : Control
         int coldCount, int maxLive, string memoryText)
     {
         _tabs = tabs != null ? new List<BrowserTab>(tabs) : new List<BrowserTab>();
+        bool activeChanged = _activeIndex != activeIndex;
         _activeIndex = activeIndex;
         _hotCount = hotCount;
         _coldCount = coldCount;
@@ -71,6 +73,13 @@ internal sealed class TabsSidebar : Control
         _memoryText = memoryText ?? "";
 
         _contentHeight = HeaderHeight + _tabs.Count * Theme.Sy(RowHeight) + FooterHeight;
+        if (Visible && ViewportHeight > 0 && activeChanged && activeIndex >= 0)
+        {
+            int top = activeIndex * RowHeightPx;
+            if (top < _scrollOffset) _scrollOffset = top;
+            else if (top + RowHeightPx > _scrollOffset + ViewportHeight)
+                _scrollOffset = top + RowHeightPx - ViewportHeight;
+        }
         ClampScroll();
         RebuildLayout();
         Invalidate();
@@ -117,7 +126,9 @@ internal sealed class TabsSidebar : Control
 
     // ---------------------------------------------------------------- 滚动
 
-    private int ViewportHeight => Math.Max(1, Height - HeaderHeight - FooterHeight);
+    private int ViewportHeight => Math.Max(0, Height - HeaderHeight - FooterHeight);
+
+    private Rectangle RowsViewport => new(0, HeaderHeight, Width, ViewportHeight);
 
     private void ClampScroll()
     {
@@ -131,8 +142,10 @@ internal sealed class TabsSidebar : Control
         {
             return;
         }
-        _scrollOffset -= e.Delta / 3;
+        _scrollOffset -= (int)Math.Round(e.Delta / 120.0 * RowHeightPx * 3);
         ClampScroll();
+        RebuildLayout();
+        _hoverRow = -3;
         Invalidate();
         base.OnMouseWheel(e);
     }
@@ -219,6 +232,8 @@ internal sealed class TabsSidebar : Control
         int visibleTop = HeaderHeight;
         int visibleBottom = Height - FooterHeight;
 
+        var state = g.Save();
+        g.SetClip(RowsViewport);
         foreach (RowHit row in _rows)
         {
             // 超出可视区域的行不画（命中区仍保留，滚回来就能点）
@@ -232,6 +247,7 @@ internal sealed class TabsSidebar : Control
                     row.Index == _activeIndex, _hoverRow == row.Index);
             }
         }
+        g.Restore(state);
     }
 
     private void DrawRow(Graphics g, Rectangle row, BrowserTab tab, bool active, bool hover)
@@ -251,8 +267,11 @@ internal sealed class TabsSidebar : Control
             _ => Theme.Dark ? Color.FromArgb(120, 126, 138) : Color.FromArgb(178, 183, 192),
         };
         int dotSize = Theme.Sx(7);
-        g.FillEllipse(new SolidBrush(dot),
-            row.Left + Theme.Sx(11), row.Top + row.Height / 2 - dotSize / 2, dotSize, dotSize);
+        using (var dotBrush = new SolidBrush(dot))
+        {
+            g.FillEllipse(dotBrush, row.Left + Theme.Sx(11),
+                row.Top + row.Height / 2 - dotSize / 2, dotSize, dotSize);
+        }
 
         int left = row.Left + Theme.Sx(26);
         int textWidth = row.Width - Theme.Sx(26) - Theme.Sx(30);
@@ -329,6 +348,7 @@ internal sealed class TabsSidebar : Control
         {
             return -2;
         }
+        if (!RowsViewport.Contains(p)) return -3;
         foreach (RowHit row in _rows)
         {
             if (row.Bounds.Contains(p))
@@ -348,17 +368,9 @@ internal sealed class TabsSidebar : Control
             Invalidate();
         }
         // 悬停在关闭按钮上时给个手型光标
-        bool onClose = false;
-        foreach (RowHit row in _rows)
-        {
-            if (row.Bounds.Contains(e.Location) &&
-                e.X > row.Bounds.Right - Theme.Sx(32))
-            {
-                onClose = true;
-                break;
-            }
-        }
-        Cursor = onClose || hit is -1 or -2 ? Cursors.Hand : Cursors.Default;
+        bool onClose = hit >= 0 && e.X > _rows[hit].Bounds.Right - Theme.Sx(32);
+        Cursor = onClose || hit is -1 or -2 || e.Y >= Height - FooterHeight
+            ? Cursors.Hand : Cursors.Default;
         base.OnMouseMove(e);
     }
 
@@ -384,6 +396,7 @@ internal sealed class TabsSidebar : Control
         {
             return;
         }
+        Focus();
 
         if (_newTabRect.Contains(e.Location))
         {
@@ -397,6 +410,13 @@ internal sealed class TabsSidebar : Control
             CloseAll?.Invoke();
             return;
         }
+
+        if (e.Y >= Height - FooterHeight)
+        {
+            ShowMemoryDialog?.Invoke();
+            return;
+        }
+        if (!RowsViewport.Contains(e.Location)) return;
 
         foreach (RowHit row in _rows)
         {
@@ -428,15 +448,14 @@ internal sealed class TabsSidebar : Control
     /// </summary>
     public string DescribeHit(Point p)
     {
-        if (_newTabRect.Contains(p)) return $"({p.X},{p.Y}) -> 新建标签按钮";
-        if (_closeAllRect.Contains(p)) return $"({p.X},{p.Y}) -> 关闭全部按钮";
-        foreach (RowHit row in _rows)
+        int hit = HitTest(p);
+        if (hit == -1) return $"({p.X},{p.Y}) -> 新建标签按钮";
+        if (hit == -2) return $"({p.X},{p.Y}) -> 关闭全部按钮";
+        if (hit >= 0)
         {
-            if (row.Bounds.Contains(p))
-            {
-                bool onClose = p.X > row.Bounds.Right - Theme.Sx(32);
-                return $"({p.X},{p.Y}) -> 第 {row.Index} 行{(onClose ? " 的关闭按钮" : "")} {row.Bounds}";
-            }
+            RowHit row = _rows[hit];
+            bool onClose = p.X > row.Bounds.Right - Theme.Sx(32);
+            return $"({p.X},{p.Y}) -> 第 {row.Index} 行{(onClose ? " 的关闭按钮" : "")} {row.Bounds}";
         }
         return $"({p.X},{p.Y}) -> 未命中（行数={_rows.Count} 内容高={_contentHeight}）";
     }
@@ -452,6 +471,44 @@ internal sealed class TabsSidebar : Control
         // 尺寸变了命中区也要跟着变，否则点击位置会整体错位
         RebuildLayout();
         base.OnSizeChanged(e);
+    }
+
+    protected override void OnVisibleChanged(EventArgs e)
+    {
+        base.OnVisibleChanged(e);
+        if (!Visible || ViewportHeight <= 0 || _activeIndex < 0) return;
+        int top = _activeIndex * RowHeightPx;
+        if (top < _scrollOffset) _scrollOffset = top;
+        else if (top + RowHeightPx > _scrollOffset + ViewportHeight)
+            _scrollOffset = top + RowHeightPx - ViewportHeight;
+        ClampScroll();
+        RebuildLayout();
+    }
+
+    protected override void OnKeyDown(KeyEventArgs e)
+    {
+        if (!e.Handled && _tabs.Count > 0)
+        {
+            int next = e.KeyCode switch
+            {
+                Keys.Up => Math.Max(0, _activeIndex - 1),
+                Keys.Down => Math.Min(_tabs.Count - 1, _activeIndex + 1),
+                Keys.Home => 0,
+                Keys.End => _tabs.Count - 1,
+                _ => -1,
+            };
+            if (next >= 0)
+            {
+                ActivateTab?.Invoke(next);
+                e.Handled = true;
+            }
+            else if (e.KeyCode == Keys.Delete && _activeIndex >= 0)
+            {
+                CloseTab?.Invoke(_activeIndex);
+                e.Handled = true;
+            }
+        }
+        base.OnKeyDown(e);
     }
 
     private readonly record struct RowHit(Rectangle Bounds, int Index);
