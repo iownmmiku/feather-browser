@@ -26,10 +26,11 @@ internal sealed class MainForm : Form
     private const string AppTitle = "轻羽浏览器";
 
     private readonly AppSettings _settings;
-    private readonly AdBlocker _adBlock = new();
-    private readonly HistoryStore _history = new();
-    private readonly BookmarkStore _bookmarks = new();
-    private readonly PasswordStore _passwords = new();
+    private readonly BrowserContext _context;
+    private readonly AdBlocker _adBlock;
+    private readonly HistoryStore _history;
+    private readonly BookmarkStore _bookmarks;
+    private readonly PasswordStore _passwords;
     private readonly bool _incognito;
     private readonly string _temporaryDataFolder;
     private readonly string _initialUrl;
@@ -72,14 +73,26 @@ internal sealed class MainForm : Form
     {
         _incognito = incognito;
         _uiTest = uiTest;
-        _settings = AppSettings.Load();
+
+        // 同一进程内所有窗口共用设置与数据存储：各自持有副本会互相覆盖
+        _context = BrowserContext.Shared;
+        _settings = _context.Settings;
 
         // 主题与倍率要在建任何控件之前定下来，否则字体与配色会不一致。
         Theme.Scale = Math.Clamp(_settings.UiScale, 1.0f, 1.6f);
         Theme.CaptureDpi(this);
-        Theme.SetMode(ResolveThemeMode(themeOverride));
+        if (themeOverride != null)
+        {
+            Theme.SetMode(ResolveThemeMode(themeOverride));
+        }
         Theme.WatchSystemTheme();
         Theme.SystemThemeChanged += OnSystemThemeChanged;
+
+        // 数据存储全部来自共用上下文
+        _adBlock = _context.AdBlock;
+        _history = _context.History;
+        _bookmarks = _context.Bookmarks;
+        _passwords = _context.Passwords;
 
         if (incognito)
         {
@@ -112,7 +125,7 @@ internal sealed class MainForm : Form
             await StartAsync();
         };
         FormClosing += OnFormClosingHandler;
-        FormClosed += (_, _) => Theme.SystemThemeChanged -= OnSystemThemeChanged;
+        FormClosed += OnFormClosedHandler;
         Resize += (_, _) => OnResized();
         Deactivate += (_, _) => OnDeactivated();
         Activated += (_, _) => OnActivatedHandler();
@@ -530,8 +543,8 @@ internal sealed class MainForm : Form
 
     private async Task StartAsync()
     {
-        _tabs = new TabManager(_settings, _adBlock, _history, _bookmarks, _passwords,
-            _viewHost, _parking, this, _incognito, _temporaryDataFolder);
+        _tabs = new TabManager(_context, _viewHost, _parking, this,
+            _incognito, _temporaryDataFolder);
         _tabs.TabsChanged += () => UpdateChrome();
         _tabs.NewWindowRequested += url =>
         {
@@ -660,9 +673,14 @@ internal sealed class MainForm : Form
                         _findInput.Text = "浏览器";
                         break;
                     case "switch":
-                        // 切到第二个标签，验证休眠/恢复与圆角标签列表的刷新
+                        // 切到第二个标签，验证休眠/恢复与标签列表的刷新
                         _tabs.Activate(1);
                         ShowTabList();
+                        break;
+                    case "multi":
+                        // 多窗口：再开一个普通窗口和一个无痕窗口，验证共用环境
+                        OpenNewWindow();
+                        OpenIncognitoWindow();
                         break;
                 }
             }
@@ -934,6 +952,11 @@ internal sealed class MainForm : Form
             },
             new()
             {
+                Text = "新建窗口", Shortcut = "Ctrl+N",
+                Action = OpenNewWindow,
+            },
+            new()
+            {
                 Text = "新建无痕窗口", Shortcut = "Ctrl+Shift+N",
                 Action = OpenIncognitoWindow,
             },
@@ -1065,6 +1088,24 @@ internal sealed class MainForm : Form
         _sidebar?.Invalidate();
 
         SetStatus("主题：" + ThemeModeLabel());
+    }
+
+    /// <summary>
+    /// 新开一个浏览器窗口（同进程）。
+    ///
+    /// <para>刻意不用「再启动一个 exe」的办法：那样会各自建一套 WebView2 环境，
+    /// 磁盘缓存与 Cookie 分裂，内存也直接翻倍。同进程多窗口共用环境与数据存储，
+    /// 在任务管理器里也更容易看总量。</para>
+    /// </summary>
+    private void OpenNewWindow()
+    {
+        var window = new MainForm(null, incognito: false)
+        {
+            // 让新窗口稍微错开，避免完全盖住原窗口
+            StartPosition = FormStartPosition.Manual,
+            Location = new Point(Left + Theme.Sx(28), Top + Theme.Sy(28)),
+        };
+        window.Show(this);
     }
 
     private void OpenIncognitoWindow()
@@ -1414,6 +1455,11 @@ internal sealed class MainForm : Form
             OpenIncognitoWindow();
             e.Handled = true;
         }
+        else if (ctrl && e.KeyCode == Keys.N)
+        {
+            OpenNewWindow();
+            e.Handled = true;
+        }
         else if (ctrl && e.KeyCode == Keys.L)
         {
             _address.Focus();
@@ -1594,6 +1640,7 @@ internal sealed class MainForm : Form
 
     private void OnFormClosingHandler(object sender, FormClosingEventArgs e)
     {
+        // 关掉正在运行的实例前先落盘设置，避免丢失
         try
         {
             _settings.Save();
@@ -1613,6 +1660,44 @@ internal sealed class MainForm : Form
             // 无痕窗口：删掉整个临时数据目录
             TryDeleteFolder(_temporaryDataFolder);
         }
+    }
+
+    /// <summary>
+    /// 窗口关闭后的收尾：解绑事件、清理内存，并在**最后一个窗口**关闭时退出进程。
+    ///
+    /// <para>多窗口下不能每个窗口一关就退出，所以这里数一遍还剩几个同类型窗口。
+    /// 最后一个窗口退出前把会话写盘（标签列表、窗口尺寸）。</para>
+    /// </summary>
+    private void OnFormClosedHandler(object sender, FormClosedEventArgs e)
+    {
+        Theme.SystemThemeChanged -= OnSystemThemeChanged;
+
+        int remaining = 0;
+        foreach (Form form in Application.OpenForms)
+        {
+            if (form is MainForm)
+            {
+                remaining++;
+            }
+        }
+
+        if (remaining > 0)
+        {
+            return;
+        }
+
+        // 最后一个窗口：保存会话后退出
+        try
+        {
+            PersistSession();
+        }
+        catch (Exception ex)
+        {
+            Log.Warn("退出前保存会话失败: " + ex.Message);
+        }
+
+        MemoryMonitor.TrimWorkingSet();
+        Application.Exit();
     }
 
     private static void TryDeleteFolder(string path)
