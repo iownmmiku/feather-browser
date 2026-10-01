@@ -93,6 +93,17 @@ public sealed class BookmarkStore
         }
     }
 
+    /// <summary>清空全部书签（书签管理页用）。</summary>
+    public void Clear()
+    {
+        if (_items.Count == 0)
+        {
+            return;
+        }
+        _items.Clear();
+        QueueSave();
+    }
+
     /// <summary>
     /// 导入用：按 URL 去重后追加。
     /// 与 <see cref="Toggle"/> 的区别是它**不会**把已存在的书签删掉 ——

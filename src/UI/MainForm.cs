@@ -1,5 +1,8 @@
+using System.Diagnostics;
+using System.Text.Json;
 using FeatherBrowser.Core;
 using FeatherBrowser.Services;
+using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
 
 namespace FeatherBrowser.UI;
@@ -31,6 +34,7 @@ internal sealed class MainForm : Form
     private readonly HistoryStore _history;
     private readonly BookmarkStore _bookmarks;
     private readonly PasswordStore _passwords;
+    private readonly DownloadStore _downloads;
     private readonly bool _incognito;
     private readonly string _temporaryDataFolder;
     private readonly string _initialUrl;
@@ -58,6 +62,7 @@ internal sealed class MainForm : Form
     private ToolbarButton _btnMenu;
 
     private TabsSidebar _sidebar;
+    private TabStrip _tabStrip;
     private bool _sidebarShown;
     private System.Windows.Forms.Timer _memoryTimer;
     private System.Windows.Forms.Timer _progressTimer;
@@ -93,6 +98,7 @@ internal sealed class MainForm : Form
         _history = _context.History;
         _bookmarks = _context.Bookmarks;
         _passwords = _context.Passwords;
+        _downloads = _context.Downloads;
 
         if (incognito)
         {
@@ -196,6 +202,19 @@ internal sealed class MainForm : Form
 
         BuildToolbarChildren();
 
+        // 顶部横向标签栏（像桌面浏览器那样）。
+        // 放在标题栏之下、工具栏之上，是整个窗口最显眼的一行。
+        _tabStrip = new TabStrip
+        {
+            Dock = DockStyle.Top,
+            Height = Theme.Sy(38),
+            ActivateTab = index => _tabs?.Activate(index),
+            CloseTab = index => CloseTabAt(index),
+            NewTab = () => _tabs?.NewTab(UrlUtils.InternalHome),
+            MoveTab = (from, to) => _tabs?.MoveTab(from, to),
+            ShowTabMenu = ShowTabContextMenu,
+        };
+
         // 标签侧边栏：画在主窗口内的常规控件，Dock=Right，默认收成 0 宽隐藏
         _sidebar = new TabsSidebar
         {
@@ -207,6 +226,8 @@ internal sealed class MainForm : Form
         };
 
         // 注意控件添加顺序：Dock=Top/Right 的控件按添加顺序从外到内堆叠。
+        // 所以最外层（标签栏）要放在最前面，最内层（网页容器）放最后。
+        Controls.Add(_tabStrip);
         Controls.Add(_viewHost);
         Controls.Add(_findBar);
         Controls.Add(_progressHost);
@@ -272,10 +293,17 @@ internal sealed class MainForm : Form
         UpdateChrome();
     }
 
-    /// <summary>把当前标签状态同步给侧边栏。</summary>
+    /// <summary>把当前标签状态同步给侧边栏与顶部标签栏。</summary>
     private void UpdateSidebar()
     {
-        if (_sidebar == null || _tabs == null)
+        if (_tabs == null)
+        {
+            return;
+        }
+
+        _tabStrip?.Update(_tabs.Tabs, _tabs.ActiveIndex);
+
+        if (_sidebar == null)
         {
             return;
         }
@@ -507,12 +535,14 @@ internal sealed class MainForm : Form
             }
         }
 
-        // 侧边栏尺寸跟着界面倍率走
+        // 侧边栏与顶部标签栏的尺寸跟着界面倍率走
         if (_sidebar != null)
         {
             _sidebar.Width = _sidebarShown ? _sidebar.ExpandedWidth : 0;
             _sidebar.Invalidate();
         }
+        _tabStrip?.Update(_tabs?.Tabs ?? Array.Empty<BrowserTab>(),
+            _tabs?.ActiveIndex ?? -1);
 
         Theme.ApplyTo(this);
         LayoutToolbar();
@@ -553,6 +583,16 @@ internal sealed class MainForm : Form
                 BeginInvoke(() => _tabs.NewTab(url));
             }
         };
+        // 内置管理页（书签 / 下载 / 历史）发来的操作请求
+        _tabs.InternalPageMessage += (tab, json) =>
+        {
+            if (IsHandleCreated)
+            {
+                BeginInvoke(() => OnInternalPageMessage(tab, json));
+            }
+        };
+        // 网页右键：在内核菜单上补充桌面浏览器的常规项
+        _tabs.ContextMenuRequested += OnContextMenuRequested;
         // 登录表单提交后询问是否保存
         _tabs.SaveCredentialRequested += (tab, username, password) =>
         {
@@ -561,8 +601,7 @@ internal sealed class MainForm : Form
                 BeginInvoke(() => PromptSaveCredential(tab, username, password));
             }
         };
-        // 内核进程被外部结束（例如在任务管理器里点了「结束任务」）：
-        // TabManager 已经把受影响的标签降为冷态并按需重建，这里只把情况告诉用户，
+        // 内核进程被外部结束（例如在任务管理器里点了「结束任务」）：        // TabManager 已经把受影响的标签降为冷态并按需重建，这里只把情况告诉用户，
         // 避免出现「浏览器看着还在、网页却永远白屏」的死状态。
         _tabs.ProcessFailed += (tab, kind, reason) =>
         {
@@ -701,6 +740,26 @@ internal sealed class MainForm : Form
                         // 多窗口：再开一个普通窗口和一个无痕窗口，验证共用环境
                         OpenNewWindow();
                         OpenIncognitoWindow();
+                        break;
+                    case "page":
+                        // 内置管理页自检：打开当前地址对应页面并 dump 文本，便于自动核对
+                        BeginInvoke(async () =>
+                        {
+                            try
+                            {
+                                string url = _tabs.Active?.Url ?? "";
+                                Log.Info($"内置页自检: url={url} Handles={InternalPages.Handles(url)}");
+                                // 页面异步加载并等宿主推数据，要给它时间
+                                await Task.Delay(3000);
+                                string text = await _tabs.Active.View.CoreWebView2
+                                    .ExecuteScriptAsync("document.body.innerText");
+                                Log.Info("内置页文本: " + text);
+                            }
+                            catch (Exception ex)
+                            {
+                                Log.Warn("内置页自检失败: " + ex.Message);
+                            }
+                        });
                         break;
                 }
             }
@@ -940,6 +999,126 @@ internal sealed class MainForm : Form
         UpdateChrome();
     }
 
+    /// <summary>复制文本到剪贴板并提示。剪贴板偶尔会被别的程序占住，所以失败要兜住。</summary>
+    private void CopyToClipboard(string text, string statusWhenDone)
+    {
+        if (string.IsNullOrEmpty(text))
+        {
+            return;
+        }
+        try
+        {
+            Clipboard.SetText(text);
+            SetStatus(statusWhenDone);
+        }
+        catch (Exception ex)
+        {
+            Log.Warn("写入剪贴板失败: " + ex.Message);
+            SetStatus("复制失败，剪贴板被其它程序占用");
+        }
+    }
+
+    /// <summary>恢复最近关闭的标签。</summary>
+    private bool RestoreClosedTab()
+    {
+        if (_tabs?.RestoreClosedTab() == true)
+        {
+            SetStatus($"已恢复关闭的标签（还可恢复 {_tabs.ClosedTabCount} 个）");
+            return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// 标签上的右键菜单（桌面浏览器的常规操作都在这里）。
+    /// </summary>
+    private void ShowTabContextMenu(int index, Point screenPoint)
+    {
+        if (_tabs == null || index < 0 || index >= _tabs.Count)
+        {
+            return;
+        }
+        BrowserTab tab = _tabs.Tabs[index];
+        bool isActive = index == _tabs.ActiveIndex;
+
+        var items = new List<MenuEntry>
+        {
+            new() { Text = "新建标签页", Action = () => _tabs.NewTab(UrlUtils.InternalHome) },
+            new()
+            {
+                Text = "重新加载", StartsGroup = true,
+                Action = () => tab.Reload(),
+            },
+            new()
+            {
+                Text = "复制标签页网址",
+                Action = () => CopyToClipboard(tab.Url, "已复制标签页网址"),
+            },
+            new()
+            {
+                Text = "关闭标签页", Shortcut = "Ctrl+W",
+                Action = () => CloseTabAt(index),
+            },
+            new()
+            {
+                Text = "关闭其它标签页",
+                Action = () => CloseOthers(index),
+            },
+            new()
+            {
+                Text = "关闭右侧标签页",
+                Action = () => CloseToRight(index),
+            },
+        };
+
+        if (_tabs.CanRestoreClosedTab)
+        {
+            items.Add(new MenuEntry
+            {
+                Text = $"恢复关闭的标签（{_tabs.ClosedTabCount}）", Shortcut = "Ctrl+Shift+T",
+                StartsGroup = true,
+                Action = () => RestoreClosedTab(),
+            });
+        }
+
+        if (!isActive)
+        {
+            items.Insert(0, new MenuEntry
+            {
+                Text = "切换到该标签页",
+                Action = () => _tabs.Activate(index),
+            });
+        }
+
+        using var menu = new PopupMenu(items, Theme.UiFont, Theme.UiFontSmall);
+        menu.ShowAtScreen(screenPoint);
+    }
+
+    private void CloseOthers(int keepIndex)
+    {
+        if (_tabs == null || keepIndex < 0 || keepIndex >= _tabs.Count)
+        {
+            return;
+        }
+        _tabs.CloseAllExcept(_tabs.Tabs[keepIndex]);
+        SetStatus("已关闭其它标签页");
+        UpdateChrome();
+    }
+
+    private void CloseToRight(int index)
+    {
+        if (_tabs == null)
+        {
+            return;
+        }
+        for (int i = _tabs.Count - 1; i > index; i--)
+        {
+            _tabs.CloseTab(_tabs.Tabs[i]);
+        }
+        SetStatus("已关闭右侧标签页");
+        UpdateChrome();
+    }
+
     private void CloseTabAt(int index)
     {
         if (_tabs == null || index < 0 || index >= _tabs.Count)
@@ -947,6 +1126,370 @@ internal sealed class MainForm : Form
             return;
         }
         _tabs.CloseTab(_tabs.Tabs[index]);
+    }
+
+    /// <summary>打开一个内置管理页（已打开就切过去，不重复开）。</summary>
+    private void OpenInternalPage(string url)
+    {
+        if (_tabs == null)
+        {
+            return;
+        }
+        for (int i = 0; i < _tabs.Count; i++)
+        {
+            if (string.Equals(_tabs.Tabs[i].Url, url, StringComparison.OrdinalIgnoreCase))
+            {
+                _tabs.Activate(i);
+                return;
+            }
+        }
+        _tabs.NewTab(url);
+    }
+
+    // ================================================================ 内置管理页
+
+    /// <summary>
+    /// 处理内置管理页发来的请求，并把最新数据推回去。
+    ///
+    /// <para>页面只发「要做什么」，数据由宿主查好再推回，页面不做任何持久化。
+    /// 这样页面即使被注入脚本也无法直接改数据。</para>
+    /// </summary>
+    private void OnInternalPageMessage(BrowserTab tab, string json)
+    {
+        string kind;
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            if (!doc.RootElement.TryGetProperty("feather", out JsonElement k))
+            {
+                return;
+            }
+            kind = k.GetString();
+        }
+        catch (Exception ex)
+        {
+            Log.Warn("内置页面消息解析失败: " + ex.Message);
+            return;
+        }
+
+        int Index(JsonElement root, string name)
+        {
+            try
+            {
+                return root.TryGetProperty(name, out JsonElement v) && v.TryGetInt32(out int i)
+                    ? i : -1;
+            }
+            catch
+            {
+                return -1;
+            }
+        }
+
+        using var doc2 = JsonDocument.Parse(json);
+        JsonElement root2 = doc2.RootElement;
+        int index = Index(root2, "index");
+
+        switch (kind)
+        {
+            case "bookmarks-load":
+                PushBookmarks(tab);
+                return;
+            case "bookmarks-open":
+                OpenFromList(_bookmarks.Items.Select(b => b.Url), index);
+                return;
+            case "bookmarks-copy":
+            {
+                var items = _bookmarks.Items;
+                if (index >= 0 && index < items.Count)
+                {
+                    CopyToClipboard(items[index].Url, "已复制书签网址");
+                }
+                return;
+            }
+            case "bookmarks-delete":
+                _bookmarks.RemoveAt(index);
+                PushBookmarks(tab);
+                SetStatus("已删除书签");
+                return;
+            case "bookmarks-clear":
+                _bookmarks.Clear();
+                PushBookmarks(tab);
+                SetStatus("已清空全部书签");
+                return;
+
+            case "history-load":
+                PushHistory(tab);
+                return;
+            case "history-open":
+                OpenFromList(_history.Snapshot().Select(h => h.Url), index);
+                return;
+            case "history-delete":
+                _history.RemoveAt(index);
+                PushHistory(tab);
+                SetStatus("已删除该条历史");
+                return;
+            case "history-clear":
+                _history.Clear();
+                PushHistory(tab);
+                SetStatus("已清空全部历史");
+                return;
+
+            case "downloads-load":
+                PushDownloads(tab);
+                return;
+            case "downloads-open":
+            case "downloads-reveal":
+                RevealDownload(index, open: true);
+                return;
+            case "downloads-folder":
+                RevealDownloadFolder();
+                return;
+            case "downloads-remove":
+                if (_downloads.RemoveAt(index))
+                {
+                    PushDownloads(tab);
+                }
+                return;
+            case "downloads-clear":
+                _downloads.ClearFinished();
+                PushDownloads(tab);
+                return;
+        }
+    }
+
+    /// <summary>按下标从一组地址里打开某一个（下标与页面里的顺序一一对应）。</summary>
+    private void OpenFromList(IEnumerable<string> urls, int index)
+    {
+        if (index < 0)
+        {
+            return;
+        }
+        var list = urls as IList<string> ?? urls.ToList();
+        if (index < list.Count && !string.IsNullOrEmpty(list[index]))
+        {
+            _tabs?.NewTab(list[index]);
+        }
+    }
+
+    private void PushBookmarks(BrowserTab tab)
+    {
+        IReadOnlyList<BookmarkEntry> items = _bookmarks.Items;
+        var payload = items.Select((b, i) => new
+        {
+            index = i,
+            title = string.IsNullOrWhiteSpace(b.Title) ? b.Url : b.Title,
+            url = b.Url,
+        }).ToList();
+        _tabs?.PushToInternalPage(tab, JsonSerializer.Serialize(new { items = payload }, JsonOpts));
+    }
+
+    private void PushHistory(BrowserTab tab)
+    {
+        List<HistoryEntry> items = _history.Snapshot();
+        var payload = items.Select((h, i) => new
+        {
+            index = i,
+            title = h.DisplayTitle,
+            url = h.Url,
+            when = h.VisitedAt,
+        }).ToList();
+        _tabs?.PushToInternalPage(tab, JsonSerializer.Serialize(new { items = payload }, JsonOpts));
+    }
+
+    private void PushDownloads(BrowserTab tab)
+    {
+        var payload = _downloads.Snapshot().Select((d, i) => new
+        {
+            index = i,
+            fileName = d.FileName,
+            url = d.Url,
+            path = d.Path,
+            state = d.State,
+            percent = d.Percent,
+            received = d.ReceivedBytes,
+            total = d.TotalBytes,
+        }).ToList();
+        _tabs?.PushToInternalPage(tab, JsonSerializer.Serialize(new { items = payload }, JsonOpts));
+    }
+
+    private void RevealDownload(int index, bool open)
+    {
+        DownloadItem item = _downloads.Get(index);
+        if (item == null || string.IsNullOrEmpty(item.Path) || !File.Exists(item.Path))
+        {
+            SetStatus("文件不存在或已被移动");
+            return;
+        }
+        try
+        {
+            if (open)
+            {
+                Process.Start(new ProcessStartInfo(item.Path) { UseShellExecute = true });
+            }
+            else
+            {
+                Process.Start("explorer.exe", $"/select,\"{item.Path}\"");
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warn("打开下载文件失败: " + ex.Message);
+            SetStatus("打不开该文件");
+        }
+    }
+
+    private void RevealDownloadFolder()
+    {
+        try
+        {
+            string folder = _downloads.Folder;
+            Directory.CreateDirectory(folder);
+            Process.Start(new ProcessStartInfo(folder) { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            Log.Warn("打开下载目录失败: " + ex.Message);
+            SetStatus("打不开下载目录");
+        }
+    }
+
+    private static readonly JsonSerializerOptions JsonOpts = new()
+    {
+        // 中文不转义成 \uXXXX，页面里直接可读
+        Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+    };
+
+    // ================================================================ 网页右键菜单
+
+    /// <summary>
+    /// 在内核的右键菜单上补充桌面浏览器的常规项。
+    ///
+    /// <para>刻意保留内核自带的项（复制、粘贴、检查等）—— 全部自绘的收益不大，
+    /// 却会丢掉拼写检查、输入法、无障碍这些成熟行为。这里只做加法。</para>
+    /// </summary>
+    private void OnContextMenuRequested(BrowserTab tab,
+        CoreWebView2ContextMenuRequestedEventArgs e)
+    {
+        try
+        {
+            IList<CoreWebView2ContextMenuItem> menu = e.MenuItems;
+            string link = e.ContextMenuTarget?.LinkUri;
+            string selection = e.ContextMenuTarget?.SelectionText;
+
+            var added = new List<CoreWebView2ContextMenuItem>();
+
+            if (!string.IsNullOrEmpty(link))
+            {
+                added.Add(MakeMenuItem("在新标签页中打开链接", () =>
+                {
+                    if (IsHandleCreated)
+                    {
+                        BeginInvoke(() => _tabs?.NewTab(link));
+                    }
+                }));
+                added.Add(MakeMenuItem("在新窗口中打开链接", () =>
+                {
+                    if (IsHandleCreated)
+                    {
+                        BeginInvoke(() =>
+                        {
+                            var window = new MainForm(link, incognito: false);
+                            window.Show(this);
+                        });
+                    }
+                }));
+                added.Add(MakeMenuItem("复制链接地址", () =>
+                {
+                    if (IsHandleCreated)
+                    {
+                        BeginInvoke(() => CopyToClipboard(link, "已复制链接地址"));
+                    }
+                }));
+            }
+            else if (!string.IsNullOrEmpty(selection))
+            {
+                string text = selection.Trim();
+                if (text.Length <= 60 && !text.Contains('\n'))
+                {
+                    added.Add(MakeMenuItem($"用 {_settings.Engine.Name} 搜索「{Shorten(text)}」", () =>
+                    {
+                        if (IsHandleCreated)
+                        {
+                            BeginInvoke(() => _tabs?.NewTab(
+                                _settings.Engine.Template.Replace("%s",
+                                    Uri.EscapeDataString(text))));
+                        }
+                    }));
+                }
+                added.Add(MakeMenuItem("复制选中文字", () =>
+                {
+                    if (IsHandleCreated)
+                    {
+                        BeginInvoke(() => CopyToClipboard(selection, "已复制选中文字"));
+                    }
+                }));
+            }
+
+            if (added.Count == 0)
+            {
+                return;
+            }
+
+            // 前面插一条分隔线，视觉上和内核自带项分开
+            var separator = tab.View.CoreWebView2.Environment
+                .CreateContextMenuItem("轻羽", null, CoreWebView2ContextMenuItemKind.Separator);
+            menu.Add(separator);
+            foreach (CoreWebView2ContextMenuItem item in added)
+            {
+                menu.Add(item);
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warn("构建右键菜单失败: " + ex.Message);
+        }
+    }
+
+    private CoreWebView2ContextMenuItem MakeMenuItem(string label, Action action)
+    {
+        CoreWebView2ContextMenuItem item = _tabs.Active.View.CoreWebView2.Environment
+            .CreateContextMenuItem(label, null, CoreWebView2ContextMenuItemKind.Command);
+        item.CustomItemSelected += (_, _) =>
+        {
+            try
+            {
+                action();
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("右键菜单动作失败: " + ex.Message);
+            }
+        };
+        return item;
+    }
+
+    private static string Shorten(string text) =>
+        text.Length <= 18 ? text : text[..18] + "…";
+
+    private void PushCurrentInternalPage()
+    {
+        BrowserTab tab = _tabs?.Active;
+        if (tab == null)
+        {
+            return;
+        }
+        if (string.Equals(tab.Url, InternalPages.BookmarksUrl, StringComparison.OrdinalIgnoreCase))
+        {
+            PushBookmarks(tab);
+        }
+        else if (string.Equals(tab.Url, InternalPages.DownloadsUrl, StringComparison.OrdinalIgnoreCase))
+        {
+            PushDownloads(tab);
+        }
+        else if (string.Equals(tab.Url, InternalPages.HistoryUrl, StringComparison.OrdinalIgnoreCase))
+        {
+            PushHistory(tab);
+        }
     }
 
     // ================================================================ 弹层
@@ -989,6 +1532,21 @@ internal sealed class MainForm : Form
             {
                 Text = "在默认浏览器中打开",
                 Action = OpenInSystemBrowser,
+            },
+            new()
+            {
+                Text = "书签管理", Shortcut = "Ctrl+Shift+O",
+                Action = () => OpenInternalPage(InternalPages.BookmarksUrl), StartsGroup = true,
+            },
+            new()
+            {
+                Text = "下载内容", Shortcut = "Ctrl+J",
+                Action = () => OpenInternalPage(InternalPages.DownloadsUrl),
+            },
+            new()
+            {
+                Text = "历史记录", Shortcut = "Ctrl+H",
+                Action = () => OpenInternalPage(InternalPages.HistoryUrl),
             },
             new()
             {
@@ -1459,6 +2017,16 @@ internal sealed class MainForm : Form
         }
         else if (ctrl && e.KeyCode == Keys.T && shift)
         {
+            // 桌面浏览器惯例：Ctrl+Shift+T 恢复刚关掉的标签。
+            // 侧边栏改用 Ctrl+Shift+E（见下），不再占用这个键位。
+            if (!RestoreClosedTab())
+            {
+                SetStatus("没有可恢复的标签");
+            }
+            e.Handled = true;
+        }
+        else if (ctrl && e.KeyCode == Keys.E && shift)
+        {
             ShowTabList();
             e.Handled = true;
         }
@@ -1747,6 +2315,15 @@ internal sealed class MainForm : Form
     {
         if (_tabs == null || _incognito)
         {
+            return;
+        }
+
+        // 自动化测试/诊断模式（--uitest=...）启动的窗口只开一两个临时标签，
+        // 如果把它的标签列表当会话存下去，用户真实的标签页就被这一两个临时页覆盖了。
+        // 这个坑真的踩过：用 --uitest=page 验证内置页面，结果把用户的会话冲掉了。
+        if (!string.IsNullOrEmpty(_uiTest))
+        {
+            Log.Info("诊断模式（--uitest）不写入会话，避免覆盖真实标签列表");
             return;
         }
 

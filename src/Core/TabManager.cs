@@ -47,11 +47,21 @@ public sealed class TabManager
 
     public BookmarkStore Bookmarks { get; }
 
+    /// <summary>下载记录。</summary>
+    public DownloadStore Downloads { get; }
+
     /// <summary>密码库。自动填充与「保存密码」提示都走它。</summary>
     public PasswordStore Passwords { get; }
 
     /// <summary>某个标签的内核进程挂了（例如被任务管理器结束），请求宿主提示。</summary>
     public event Action<BrowserTab, string, string> ProcessFailed;
+
+    /// <summary>
+    /// 网页右键被按下，宿主可以往菜单里补充自己的项。
+    /// 参数：标签、内核给的菜单对象、以及该位置的上下文信息。
+    /// </summary>
+    public event Action<BrowserTab, CoreWebView2ContextMenuRequestedEventArgs>
+        ContextMenuRequested;
 
     /// <summary>需要询问用户是否保存登录凭据时触发（账号, 密码）。</summary>
     public event Action<BrowserTab, string, string> SaveCredentialRequested;
@@ -62,6 +72,74 @@ public sealed class TabManager
     public string TemporaryDataFolder { get; }
 
     public IReadOnlyList<BrowserTab> Tabs => _tabs;
+
+    /// <summary>最近关闭的标签（栈，末尾最新），供「恢复关闭的标签」使用。</summary>
+    private readonly List<ClosedTab> _closedTabs = new();
+
+    /// <summary>关闭历史最多留这么多条。浏览器惯例是十几个，这里给宽一点。</summary>
+    private const int MaxClosedHistory = 25;
+
+    /// <summary>还有没有可恢复的标签。</summary>
+    public bool CanRestoreClosedTab => _closedTabs.Count > 0;
+
+    /// <summary>最近关闭的标签个数。</summary>
+    public int ClosedTabCount => _closedTabs.Count;
+
+    /// <summary>
+    /// 恢复最近关闭的一个标签。恢复后它会成为当前标签。
+    /// </summary>
+    /// <returns>恢复了就返回 true；没有可恢复的返回 false。</returns>
+    public bool RestoreClosedTab()
+    {
+        if (_closedTabs.Count == 0)
+        {
+            return false;
+        }
+
+        ClosedTab last = _closedTabs[^1];
+        _closedTabs.RemoveAt(_closedTabs.Count - 1);
+        Log.Info($"恢复关闭的标签: {last.Url}");
+        NewTab(last.Url);
+        return true;
+    }
+
+    /// <summary>
+    /// 调整标签顺序（拖动标签栏时用）。
+    /// </summary>
+    /// <param name="from">原位置。</param>
+    /// <param name="to">目标位置。</param>
+    public void MoveTab(int from, int to)
+    {
+        if (from < 0 || from >= _tabs.Count || to < 0 || to >= _tabs.Count || from == to)
+        {
+            return;
+        }
+
+        BrowserTab moved = _tabs[from];
+        _tabs.RemoveAt(from);
+        _tabs.Insert(to, moved);
+
+        // 当前标签跟着它自己走，而不是跟着下标
+        int active = ActiveIndex;
+        if (active == from)
+        {
+            ActiveIndex = to;
+        }
+        else if (from < active && to >= active)
+        {
+            ActiveIndex = active - 1;
+        }
+        else if (from > active && to <= active)
+        {
+            ActiveIndex = active + 1;
+        }
+
+        // 只改了顺序，不需要重建任何视图
+        TabsChanged?.Invoke();
+    }
+
+    /// <summary>被关闭的标签记录。</summary>
+    private sealed record ClosedTab(string Url, string Title);
 
     public int Count => _tabs.Count;
 
@@ -106,6 +184,7 @@ public sealed class TabManager
         History = context.History;
         Bookmarks = context.Bookmarks;
         Passwords = context.Passwords;
+        Downloads = context.Downloads;
         _viewHost = viewHost;
         _parking = parking;
         _uiInvoker = uiInvoker;
@@ -122,15 +201,13 @@ public sealed class TabManager
     public static async Task<CoreWebView2Environment> CreateEnvironmentAsync(
         string userDataFolder, bool forceDarkPages)
     {
-        var options = new CoreWebView2EnvironmentOptions
+        var options = new CoreWebView2EnvironmentOptions(
+            "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection " +
+            "--disable-background-timer-throttling=false " +
+            // 让内核子进程继承本程序的身份，任务管理器里才会归到「轻羽浏览器」名下，
+            // 而不是显示成一堆 msedgewebview2
+            $"--app-user-model-id={AppIdentity.AppUserModelId}")
         {
-            // 关掉一些用不到的后台特性，减少常驻线程与内存
-            AdditionalBrowserArguments =
-                "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection " +
-                "--disable-background-timer-throttling=false " +
-                // 让内核子进程继承本程序的身份，任务管理器里才会归到「轻羽浏览器」名下，
-                // 而不是显示成一堆 msedgewebview2
-                $"--app-user-model-id={AppIdentity.AppUserModelId}",
             Language = "zh-CN",
         };
 
@@ -141,6 +218,13 @@ public sealed class TabManager
             options.AdditionalBrowserArguments += " --enable-features=WebContentsForceDark";
         }
 
+        // 关于自定义 scheme（记录一个踩过的坑）：
+        // 曾想用 CoreWebView2CustomSchemeRegistration 把 feather.local 声明成安全 scheme，
+        // 但这个 SDK 版本上 options.CustomSchemeRegistrations 是只读属性且**默认是 null**，
+        // 调 Add 必抛 NullReference，也无法给它赋值（编译不过）。
+        // 实测不需要它：SetVirtualHostNameToFolderMapping + https:// 前缀的虚拟主机
+        // 本身就能正常加载页面（已用 ExecuteScriptAsync 取页面文本验证过）。
+
         var environment = await CoreWebView2Environment.CreateAsync(
             browserExecutableFolder: null,
             userDataFolder: userDataFolder,
@@ -148,6 +232,25 @@ public sealed class TabManager
 
         Log.Info($"WebView2 环境就绪，用户数据目录: {userDataFolder}");
         return environment;
+    }
+
+    /// <summary>
+    /// 把内置管理页的虚拟主机指到磁盘上的页面目录。
+    /// 映射是实例级的（不是环境级），所以每个 WebView2 都要设一次。
+    /// </summary>
+    internal static void MapInternalPages(CoreWebView2 core)
+    {
+        try
+        {
+            string folder = InternalPages.Folder;
+            Directory.CreateDirectory(folder);
+            core.SetVirtualHostNameToFolderMapping(
+                InternalPages.Host, folder, CoreWebView2HostResourceAccessKind.DenyCors);
+        }
+        catch (Exception ex)
+        {
+            Log.Warn("映射内置页面目录失败: " + ex.Message);
+        }
     }
 
     /// <summary>
@@ -326,6 +429,17 @@ public sealed class TabManager
 
         _tabs.RemoveAt(index);
         tab.Dispose();
+
+        // 记下来，供「恢复关闭的标签」(Ctrl+Shift+T) 用。
+        // 空地址不记（例如刚建出来还没导航的标签），恢复它没有意义。
+        if (!string.IsNullOrWhiteSpace(tab.Url) && !UrlUtils.IsInternal(tab.Url))
+        {
+            _closedTabs.Add(new ClosedTab(tab.Url, tab.Title));
+            while (_closedTabs.Count > MaxClosedHistory)
+            {
+                _closedTabs.RemoveAt(0);
+            }
+        }
 
         if (_tabs.Count == 0)
         {
@@ -770,6 +884,102 @@ public sealed class TabManager
     }
 
     internal void NotifyWindowCloseRequested(BrowserTab tab) => CloseTab(tab);
+
+    internal void NotifyContextMenuRequested(BrowserTab tab,
+        CoreWebView2ContextMenuRequestedEventArgs e) =>
+        ContextMenuRequested?.Invoke(tab, e);
+
+    /// <summary>内置管理页发来的消息（JSON）。宿主负责解析与响应。</summary>
+    public event Action<BrowserTab, string> InternalPageMessage;
+
+    internal void NotifyInternalPageMessage(BrowserTab tab, string json) =>
+        InternalPageMessage?.Invoke(tab, json);
+
+    /// <summary>
+    /// 把数据推给内置管理页。
+    ///
+    /// <para>用 <c>ExecuteScriptAsync</c> 调页面上的 <c>window.featherUpdate</c> 回调。
+    /// 数据走 JSON 序列化后拼进脚本，所以必须转义，否则文件名里的引号会破坏脚本。</para>
+    /// </summary>
+    internal async void PushToInternalPage(BrowserTab tab, string json)
+    {
+        try
+        {
+            WebView2 view = tab?.View;
+            if (view?.CoreWebView2 == null)
+            {
+                Log.Warn("推数据给内置页失败：视图还没就绪");
+                return;
+            }
+            string script = $"window.featherUpdate({json});";
+            Log.Info($"推数据给内置页: {json.Length} 字节 JSON");
+            await view.CoreWebView2.ExecuteScriptAsync(script);
+        }
+        catch (Exception ex)
+        {
+            Log.Warn("向内置页面推送数据失败: " + ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// 内核开始一次下载。
+    ///
+    /// <para>只记录状态，不接管字节流：内核会按浏览器默认行为把文件写进下载目录，
+    /// 我们订阅它的进度回调更新记录。这样大文件不会多一次拷贝。</para>
+    /// </summary>
+    internal void HandleDownloadStarting(CoreWebView2DownloadStartingEventArgs e)
+    {
+        try
+        {
+            CoreWebView2DownloadOperation op = e.DownloadOperation;
+            string fileName = "未命名文件";
+            try
+            {
+                string fromUri = Path.GetFileName(new Uri(op.Uri).LocalPath);
+                if (!string.IsNullOrWhiteSpace(fromUri))
+                {
+                    fileName = Uri.UnescapeDataString(fromUri);
+                }
+            }
+            catch
+            {
+                // Uri 解析失败就用兜底名字
+            }
+
+            DownloadItem item = Downloads.Begin(op.Uri, fileName);
+            Log.Info($"开始下载: {fileName} <- {op.Uri}");
+
+            op.BytesReceivedChanged += (_, _) =>
+                Downloads.UpdateProgress(item, (long)op.BytesReceived, (long)op.TotalBytesToReceive);
+
+            op.StateChanged += (_, _) =>
+            {
+                switch (op.State)
+                {
+                    case CoreWebView2DownloadState.Completed:
+                        Downloads.Complete(item, op.ResultFilePath,
+                            (long)op.TotalBytesToReceive);
+                        Log.Info($"下载完成: {op.ResultFilePath}");
+                        DownloadsChanged?.Invoke();
+                        break;
+                    case CoreWebView2DownloadState.Interrupted:
+                        Downloads.Fail(item, op.InterruptReason.ToString());
+                        Log.Warn($"下载中断: {item.FileName} / {op.InterruptReason}");
+                        DownloadsChanged?.Invoke();
+                        break;
+                }
+            };
+
+            DownloadsChanged?.Invoke();
+        }
+        catch (Exception ex)
+        {
+            Log.Warn("处理下载开始事件失败: " + ex.Message);
+        }
+    }
+
+    /// <summary>下载状态有变化（开始 / 完成 / 中断），宿主可据此刷新下载页。</summary>
+    public event Action DownloadsChanged;
 
     /// <summary>
     /// 某个标签的内核进程异常退出。

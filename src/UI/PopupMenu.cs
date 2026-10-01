@@ -115,6 +115,32 @@ internal sealed class PopupMenu : Form
         Deactivate += (_, _) => Close();
     }
 
+    /// <summary>在指定屏幕坐标弹出（用于标签栏等非控件锚点的场景）。</summary>
+    public void ShowAtScreen(Point screenPoint)
+    {
+        using (GraphicsPath path = Theme.RoundedRect(
+                   new Rectangle(0, 0, Width, Height), Theme.Radius))
+        {
+            Region = new Region(path);
+        }
+        Padding = new Padding(Theme.Sx(6), Theme.Sy(6), Theme.Sx(6), Theme.Sy(6));
+
+        Rectangle wa = Screen.FromPoint(screenPoint).WorkingArea;
+        int x = Math.Min(screenPoint.X, wa.Right - Width - Theme.Sx(6));
+        int y = screenPoint.Y;
+        if (y + Height > wa.Bottom)
+        {
+            y = screenPoint.Y - Height;
+        }
+        x = Math.Max(wa.Left + Theme.Sx(6), x);
+        y = Math.Max(wa.Top + Theme.Sx(6), y);
+
+        Location = new Point(x, y);
+        Show();
+        Activate();
+        _list.Focus();
+    }
+
     /// <summary>在指定控件的下方或上方弹出。</summary>
     public void ShowAt(Control anchor)
     {

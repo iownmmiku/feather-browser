@@ -133,7 +133,41 @@ WebView2 直接销毁，并调用 `MemoryMonitor.TrimWorkingSet()`
 > 多窗口让内存统计变得更好看：任务管理器里只有一个 `FeatherBrowser.exe`，
 > 内核子进程数随标签数变化而不是随窗口数翻倍。
 
-### 9. 内核进程被外部结束时自动恢复
+### 9. 内置管理页用虚拟主机，不用自定义协议
+
+书签 / 下载 / 历史这三个页面是磁盘上的 HTML，放在
+`%LOCALAPPDATA%\FeatherBrowser\pages\`，通过
+`SetVirtualHostNameToFolderMapping` 映射到 `https://feather.local/`。
+
+**为什么不用 `feather://` 自定义协议**（这里踩了两个坑，都很难查）：
+
+1. `AddWebResourceRequestedFilter("feather://*")` 不报错也不生效，导航直接以
+   `ConnectionAborted` 失败；
+2. 改成注册 `*` / All 之后，`WebResourceRequested` 处理器**依然一次都没被调用** ——
+   WebView2 对自定义协议根本不走这个事件。
+
+结果就是页面全空白，日志里还看不出原因。
+
+### 10. 页面与宿主通信的两个坑
+
+**发消息必须传字符串。** 页面用 `postMessage(obj)` 发对象时，宿主调
+`TryGetWebMessageAsString()` 会抛
+`ArgumentException: Value does not fall within the expected range.`，
+而外层如果是个空 `catch`，就完全看不出发生过什么 —— 表现成「页面消息根本没发出来」，
+排查方向会被彻底带偏。现在页面发 `JSON.stringify(...)`，宿主侧也一定留日志。
+
+**通道就绪要重试。** `window.chrome.webview` 这个桥不保证在脚本解析时就存在。
+早期版本在脚本顶层直接调 `postMessage`，桥还没注入就被 `if` 静默跳过。
+现在做成「能发就发、发不出去重试 25 次」，彻底失败才在页面上明确报错。
+
+### 11. 诊断模式不写会话
+
+`--uitest=...` 启动的窗口只开一两个临时标签。如果退出时把它当会话存下去，
+用户真实的标签列表就被这一两个临时页覆盖了 —— 这个坑真的踩过：
+用 `--uitest=page` 验证内置页面时把用户的会话冲掉了（后来从夸克重新导入恢复）。
+现在诊断模式不写会话。
+
+### 12. 内核进程被外部结束时自动恢复
 
 程序本质上是 WebView2 的宿主，所以「浏览器外壳」和「网页进程」在任务管理器里是分开的。
 如果只结束网页进程，外壳还在，就可能留下一个永远白屏的死界面。为此程序监听了内核的
@@ -203,10 +237,18 @@ WebView2 直接销毁，并调用 `MemoryMonitor.TrimWorkingSet()`
 **浏览**
 - 地址栏智能识别：输入 `github.com` 直接访问，输入「天气」送去搜索
 - 后退 / 前进 / 刷新 / 停止 / 首页
+- **顶部标签栏**（像桌面浏览器那样横排在窗口顶部）：显示标题与存活档位色点，
+  可点击切换、中键或点 × 关闭、**拖动排序**、滚轮横向滚动
 - **多窗口**（`Ctrl+N`）：同进程内开新窗口，共用内核与数据（见下）
-- **标签侧边栏**（点标签按钮或 `Ctrl+Shift+T`）：列出全部标签，显示标题、域名与存活档位
-  （绿点=渲染中 / 灰点=已休眠），可切换、单独关闭、新建、关闭全部；底部显示内存策略状态
+- **标签侧边栏**（`Ctrl+Shift+E`）：完整的标签列表，带内存档位与实时内存读数
 - 多标签：新建、关闭、切换、关闭全部、恢复上次会话（最多 20 个）
+
+**管理页与右键菜单**
+- **书签管理**（`Ctrl+Shift+O`）：搜索、打开、复制、删除、清空
+- **下载内容**（`Ctrl+J`）：进度、完成后打开或定位文件、清除已完成
+- **历史记录**（`Ctrl+H`）：按今天/昨天分组、搜索、按时间范围筛选、删除单条
+- **网页右键菜单**：在链接上可新标签/新窗口打开、复制链接；选中文字可直接搜索或复制
+- **标签右键菜单**：重新加载、复制网址、关闭/关闭其它/关闭右侧、恢复关闭的标签
 - 无痕窗口：独立临时数据目录，关闭时整体删除
 - 页内查找（注入脚本实现，用 `window.find`）
 - 缩放 25%～500%；F11 全屏
@@ -305,13 +347,14 @@ FeatherBrowser.exe --import-quark=passwords
 |---|---|---|---|
 | `Ctrl+T` | 新建标签 | `Ctrl+W` | 关闭当前标签 |
 | `Ctrl+N` | 新建窗口 | `Ctrl+Shift+N` | 无痕窗口 |
-| `Ctrl+Shift+T` | 标签侧边栏 | `Ctrl+Tab` | 下一个标签 |
-| `Ctrl+Tab` | 下一个标签 | `Ctrl+PageUp/Down` | 上/下一个标签 |
+| `Ctrl+Shift+T` | 恢复关闭的标签 | `Ctrl+Shift+E` | 标签侧边栏 |
+| `Ctrl+Shift+O` | 书签管理 | `Ctrl+J` | 下载内容 |
+| `Ctrl+H` | 历史记录 | `Ctrl+Tab` | 下一个标签 |
 | `Ctrl+L` | 聚焦地址栏 | `Ctrl+D` | 收藏当前页 |
 | `Ctrl+F` | 页内查找 | `F5` / `Ctrl+R` | 刷新 |
 | `Alt+←/→` | 后退 / 前进 | `Ctrl++` `Ctrl+-` | 网页缩放 |
-| `Ctrl+J` | 切换主题 | `Ctrl+=` / `Ctrl+0` | 界面放大 / 复位 |
-| `F11` | 全屏 | `Esc` | 停止加载 / 关闭查找条 |
+| `Ctrl+=` / `Ctrl+0` | 界面放大 / 复位 | `F11` | 全屏 |
+| `Esc` | 停止加载 / 关闭查找条 | | |
 
 ## 九、实测数据
 
@@ -358,6 +401,8 @@ feather-browser/
 │  │  ├─ Dpapi.cs                Windows 数据保护 API 封装（支持指定熵）
 │  │  ├─ QuarkImporter.cs        ★ 从夸克迁移书签 / 历史 / 密码
 │  │  ├─ LoginAutofill.cs        登录表单辅助脚本的装载与拼装
+│  │  ├─ InternalPages.cs        ★ 内置管理页（书签/下载/历史）的页面定义与落盘
+│  │  ├─ DownloadStore.cs        下载记录
 │  │  └─ UrlUtils.cs             地址识别、eTLD+1、内置首页 HTML
 │  ├─ Services/
 │  │  ├─ AppSettings.cs          设置与会话（含主题模式、界面倍率）
@@ -369,7 +414,8 @@ feather-browser/
 │     ├─ ToolbarButton.cs        自绘圆角图标按钮（带数字徽标）
 │     ├─ ThemedInputs.cs         深色可用的输入框 / 下拉框 / 数字框
 │     ├─ WindowChrome.cs         请求 Windows 深色标题栏
-│     ├─ TabsSidebar.cs          ★ 标签侧边栏（画在主窗口内，不是弹窗）
+│     ├─ TabsSidebar.cs          ★ 标签侧边栏（主窗口内的面板）
+│     ├─ TabStrip.cs             ★ 顶部横向标签栏（可拖动排序）
 │     ├─ PopupMenu.cs            下拉菜单（圆角面板）
 │     ├─ StatusBar.cs            自绘状态栏
 │     ├─ MemoryDialog.cs         内存与性能面板
@@ -399,7 +445,7 @@ feather-browser/
 FeatherBrowser.exe --theme=dark
 
 # 启动后自动打开某个界面，配合 tools\screenshot.ps1 自动出图核对排版
-# 取值：tabs | menu | settings | memory | find | switch
+# 取值：tabs | menu | settings | memory | find | switch | multi | page
 FeatherBrowser.exe --uitest=settings
 $env:FEATHER_UITEST_DELAY='2000'   # 控制弹层延时（毫秒）
 

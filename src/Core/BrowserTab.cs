@@ -99,7 +99,8 @@ public sealed class BrowserTab : IDisposable
             }
             if (UrlUtils.IsInternal(Url))
             {
-                return DefaultTitle;
+                // 内置管理页有正式标题，别显示成「新标签页」
+                return InternalPages.TitleFor(Url);
             }
 
             // 没有真实标题时回退到域名，比显示「新标签页」有用得多
@@ -112,8 +113,14 @@ public sealed class BrowserTab : IDisposable
         }
     }
 
-    /// <summary>是否显示内置首页而不是真实网页。</summary>
-    public bool IsHomePage => UrlUtils.IsInternal(Url);
+    /// <summary>
+    /// 是否显示内置首页。
+    ///
+    /// <para>注意只能匹配 <c>feather://home</c>，不能笼统判断 <c>feather://</c> ——
+    /// 书签 / 下载 / 历史这些内置页也是 feather 协议，
+    /// 笼统判断会把它们全都替换成首页内容（曾经就是这样，页面一直是首页）。</para>
+    /// </summary>
+    public bool IsHomePage => UrlUtils.IsHome(Url);
 
     internal void RaiseChanged() => Changed?.Invoke(this);
 
@@ -342,6 +349,7 @@ public sealed class BrowserTab : IDisposable
         {
             if (isHtml)
             {
+                Log.Info($"导航到内置首页 (HTML {target.Length} 字节)");
                 View.CoreWebView2.NavigateToString(target);
             }
             else if (target.StartsWith("feather://search?q=", StringComparison.OrdinalIgnoreCase))
@@ -577,6 +585,18 @@ public sealed class BrowserTab : IDisposable
 
         core.WindowCloseRequested += (_, _) => _manager.NotifyWindowCloseRequested(this);
 
+        // 内置管理页（书签 / 下载 / 历史）走虚拟主机映射：把 feather.local 指到页面目录。
+        // 曾经试过 feather:// 自定义协议 + WebResourceRequested，实测处理器根本不会被调用
+        // （WebView2 不为自定义协议触发该事件），导航直接 ConnectionAborted，页面全空白。
+        TabManager.MapInternalPages(core);
+
+        // 右键菜单：在内核自带的菜单上补充桌面浏览器的常规操作
+        core.ContextMenuRequested += (_, e) => _manager.NotifyContextMenuRequested(this, e);
+
+        // 下载：交给内核按浏览器默认方式存盘，我们只记录状态供下载页展示。
+        // 不接管字节流是有意的 —— 接管会让大文件多一次拷贝，也更容易出错。
+        core.DownloadStarting += (_, e) => _manager.HandleDownloadStarting(e);
+
         // 内核进程意外消失时上报。
         // 用户可能用任务管理器单独结束了某个渲染进程 —— 那时外壳还在，
         // 但那个标签已经是死壳子。必须让宿主知道，才能自动恢复或给出提示，
@@ -585,12 +605,34 @@ public sealed class BrowserTab : IDisposable
             _manager.NotifyProcessFailed(this, e.ProcessFailedKind.ToString(),
                 e.Reason.ToString());
 
-        // 登录表单自动填充：页面发回的消息在这里处理
+        // 登录表单自动填充与内置管理页：页面发回的消息都在这里分流
         core.WebMessageReceived += (_, e) =>
         {
+            // 先无条件记录「事件到了」这件事本身。
+            // 之前这一步在 try 里面，处理器内部一抛异常就被空 catch 吞掉，
+            // 结果看上去像「页面的消息从来没发出来」，排查方向完全被带偏。
+            bool debug = Environment.GetEnvironmentVariable("FEATHER_DEBUG_MSG") == "1";
+            if (debug)
+            {
+                Log.Info("WebMessageReceived 事件已触发");
+            }
+
             try
             {
-                var parsed = LoginAutofill.ParseMessage(e.TryGetWebMessageAsString());
+                string raw = e.TryGetWebMessageAsString();
+                if (debug)
+                {
+                    Log.Info($"页面消息原文: {raw}");
+                }
+
+                // 内置管理页的消息是 JSON 对象（以 { 开头），自动填充的是自己的紧凑格式
+                if (!string.IsNullOrEmpty(raw) && raw.TrimStart().StartsWith("{"))
+                {
+                    _manager.NotifyInternalPageMessage(this, raw);
+                    return;
+                }
+
+                var parsed = LoginAutofill.ParseMessage(raw);
                 if (parsed == null)
                 {
                     return;
@@ -606,9 +648,11 @@ public sealed class BrowserTab : IDisposable
                         break;
                 }
             }
-            catch
+            catch (Exception ex)
             {
-                // 页面消息格式不对就忽略，不影响浏览
+                // 以前这里是空 catch：处理器自己出错时完全没有痕迹，
+                // 表现成「页面的消息没到」，非常容易被误导。现在一定留下日志。
+                Log.Warn($"处理页面消息失败: {ex.GetType().Name} / {ex.Message}");
             }
         };
 

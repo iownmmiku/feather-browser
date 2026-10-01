@@ -36,6 +36,7 @@ public sealed class BrowserContext
         History = new HistoryStore();
         Bookmarks = new BookmarkStore();
         Passwords = new PasswordStore();
+        Downloads = new DownloadStore();
     }
 
     public AppSettings Settings { get; }
@@ -47,6 +48,9 @@ public sealed class BrowserContext
     public BookmarkStore Bookmarks { get; }
 
     public PasswordStore Passwords { get; }
+
+    /// <summary>下载记录。多个窗口共用一份。</summary>
+    public DownloadStore Downloads { get; }
 
     /// <summary>普通窗口共用的 WebView2 环境；第一个窗口打开时创建。</summary>
     private CoreWebView2Environment _sharedEnvironment;

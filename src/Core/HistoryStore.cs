@@ -74,6 +74,32 @@ public sealed class HistoryStore
         SaveNow();
     }
 
+    /// <summary>按快照下标删除一条（历史管理页用）。</summary>
+    /// <returns>删掉了返回 true。</returns>
+    public bool RemoveAt(int index)
+    {
+        // 内部是 LinkedList，没有 RemoveAt，按下标找到节点再删
+        lock (_gate)
+        {
+            if (index < 0 || index >= _items.Count)
+            {
+                return false;
+            }
+            LinkedListNode<HistoryEntry> node = _items.First;
+            for (int i = 0; i < index && node != null; i++)
+            {
+                node = node.Next;
+            }
+            if (node == null)
+            {
+                return false;
+            }
+            _items.Remove(node);
+        }
+        SaveNow();
+        return true;
+    }
+
     /// <summary>记录一次访问（当前时间）。相同 URL 只保留最新的一条。</summary>
     public void Record(string url, string title)
     {

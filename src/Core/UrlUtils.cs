@@ -20,7 +20,19 @@ public static class UrlUtils
 
     public static bool IsInternal(string url) =>
         !string.IsNullOrEmpty(url) &&
-        url.StartsWith("feather://", StringComparison.OrdinalIgnoreCase);
+        (url.StartsWith("feather://", StringComparison.OrdinalIgnoreCase) ||
+         url.StartsWith("https://" + InternalPages.Host + "/", StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>
+    /// 是否就是内置首页。
+    ///
+    /// <para>必须和 <see cref="IsInternal"/> 分开：书签 / 下载 / 历史页也是内部地址，
+    /// 但它们是真实页面（由虚拟主机映射提供内容），
+    /// 不能像首页那样用 NavigateToString 顶掉 —— 曾经笼统判断导致这几个页面全显示成首页。</para>
+    /// </summary>
+    public static bool IsHome(string url) =>
+        !string.IsNullOrEmpty(url) &&
+        url.TrimEnd('/').Equals(InternalHome, StringComparison.OrdinalIgnoreCase);
 
     /// <summary>判断输入应当作为网址打开还是送去搜索。</summary>
     public static bool LooksLikeUrl(string input)

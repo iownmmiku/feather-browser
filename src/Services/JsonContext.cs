@@ -17,6 +17,8 @@ namespace FeatherBrowser.Services;
 [JsonSerializable(typeof(List<HistoryEntry>))]
 [JsonSerializable(typeof(PasswordEntry))]
 [JsonSerializable(typeof(PasswordFile))]
+[JsonSerializable(typeof(DownloadItem))]
+[JsonSerializable(typeof(List<DownloadItem>))]
 internal partial class JsonContext : JsonSerializerContext
 {
 }

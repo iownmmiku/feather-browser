@@ -20,6 +20,10 @@ internal static class Program
 
         AppPaths.EnsureCreated();
 
+        // 内置管理页（书签 / 下载 / 历史）是磁盘上的 HTML，由虚拟主机映射提供。
+        // 每次启动重写一遍，页面才跟得上程序版本。
+        InternalPages.Materialize();
+
         // 自检模式：不需要人看界面，跑完把内存数据写进文件，便于脚本化验证。
         if (args.Length > 0 && args[0].Equals("--selftest", StringComparison.OrdinalIgnoreCase))
         {
