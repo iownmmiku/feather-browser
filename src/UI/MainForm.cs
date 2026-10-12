@@ -75,6 +75,7 @@ internal sealed class MainForm : Form
     private bool _addressDirty;
     private bool _closing;
     private bool _findFirstMatch = true;
+    private BrowserTab _displayedTab;
     private FormWindowState _lastWindowState;
     private string _statusText = "就绪";
 
@@ -143,7 +144,7 @@ internal sealed class MainForm : Form
         _lastWindowState = WindowState;
 
         // 窗口被拖到另一块 DPI 不同的显示器时，重新换算。
-        DpiChangedAfterParent += (_, _) =>
+        DpiChanged += (_, _) =>
         {
             Theme.CaptureDpi(this);
             ApplyScaledMetrics();
@@ -214,7 +215,7 @@ internal sealed class MainForm : Form
             Height = Theme.Sy(38),
             ActivateTab = index => _tabs?.Activate(index),
             CloseTab = index => CloseTabAt(index),
-            NewTab = () => _tabs?.NewTab(UrlUtils.InternalHome),
+            NewTab = OpenNewTab,
             MoveTab = (from, to) => _tabs?.MoveTab(from, to),
             ShowTabMenu = ShowTabContextMenu,
         };
@@ -224,7 +225,7 @@ internal sealed class MainForm : Form
         {
             ActivateTab = index => _tabs?.Activate(index),
             CloseTab = index => CloseTabAt(index),
-            NewTab = () => _tabs?.NewTab(UrlUtils.InternalHome),
+            NewTab = OpenNewTab,
             CloseAll = CloseAllTabs,
             ShowMemoryDialog = ShowMemoryDialog,
         };
@@ -250,6 +251,7 @@ internal sealed class MainForm : Form
     /// <summary>展开 / 收起标签侧边栏，网页始终保留在相邻的内容区域。</summary>
     private void ToggleSidebar()
     {
+        if (_fullscreen) ToggleFullscreen();
         if (_tabs == null)
         {
             return;
@@ -307,7 +309,11 @@ internal sealed class MainForm : Form
     {
         _btnBack = MakeToolButton("\u2190", "后退 (Alt+←)", GoBack);
         _btnForward = MakeToolButton("\u2192", "前进 (Alt+→)", GoForward);
-        _btnReload = MakeToolButton("\u21BB", "刷新 (F5)", Reload);
+        _btnReload = MakeToolButton("\u21BB", "刷新 / 停止加载 (F5 / Esc)", () =>
+        {
+            if (_tabs?.Active?.IsLoading == true) _tabs.Active.Stop();
+            else Reload();
+        });
         _btnHome = MakeToolButton("\u2302", "打开首页", GoHome);
 
         _addressBox = new Panel { BackColor = Theme.Surface };
@@ -569,6 +575,21 @@ internal sealed class MainForm : Form
         _tabs = new TabManager(_context, _viewHost, _parking, this,
             _incognito, _temporaryDataFolder, _downloads);
         _tabs.TabsChanged += () => UpdateChrome();
+        _tabs.ShortcutRequested += keys => OnFormKeyDown(this, new KeyEventArgs(keys));
+        _tabs.FindResult += (ordinal, count) =>
+        {
+            if (_findBar.Visible && _findInput.Text.Length > 0)
+                _findCount.Text = count > 0 && ordinal <= 0 ? $"共 {count} 处" : $"{Math.Max(0, ordinal)}/{count}";
+        };
+        _tabs.NavigationCompleted += tab =>
+        {
+            if (tab == _tabs.Active && _findBar.Visible) { _findFirstMatch = true; FindNext(true); }
+        };
+        _tabs.FullscreenRequested += fullscreen =>
+        {
+            _pageFullscreen = fullscreen;
+            SetFullscreen(_manualFullscreen || _pageFullscreen);
+        };
         _tabs.DownloadsChanged += () =>
         {
             foreach (var tab in _tabs.Tabs.Where(t => t.Url == InternalPages.DownloadsUrl && t.View?.Engine != null))
@@ -816,9 +837,23 @@ internal sealed class MainForm : Form
         }
 
         BrowserTab tab = _tabs.Active;
+        if (!ReferenceEquals(_displayedTab, tab))
+        {
+            if (_pageFullscreen)
+            {
+                _pageFullscreen = false;
+                SetFullscreen(_manualFullscreen);
+            }
+            _displayedTab = tab;
+            _addressDirty = false;
+            _findFirstMatch = true;
+            _findCount.Text = "";
+            if (_findBar.Visible && tab?.View?.Engine != null) FindNext(true);
+        }
 
         _btnBack.Enabled = tab?.CanGoBack == true;
         _btnForward.Enabled = tab?.CanGoForward == true;
+        _btnReload.Glyph = tab?.IsLoading == true ? "\u00D7" : "\u21BB";
         _btnTabs.Active = _sidebarShown;
         _btnTabs.Badge = _tabs.Count > 1 ? _tabs.Count : 0;
 
@@ -954,7 +989,21 @@ internal sealed class MainForm : Form
         _addressDirty = false;
         _address.SelectAll();
         _tabs.Active.NavigateTo(url);
-        _viewHost.Focus();
+        FocusPage();
+    }
+
+    private void FocusPage()
+    {
+        if (_tabs?.Active?.View is { IsDisposed: false } view) view.Focus();
+    }
+
+    private void OpenNewTab()
+    {
+        if (_tabs == null || _closing) return;
+        if (_fullscreen) ToggleFullscreen();
+        _tabs.NewTab(UrlUtils.InternalHome);
+        _address.Focus();
+        _address.SelectAll();
     }
 
     private void GoBack()
@@ -1043,7 +1092,7 @@ internal sealed class MainForm : Form
 
         var items = new List<MenuEntry>
         {
-            new() { Text = "新建标签页", Action = () => _tabs.NewTab(UrlUtils.InternalHome) },
+            new() { Text = "新建标签页", Action = OpenNewTab },
             new()
             {
                 Text = "重新加载", StartsGroup = true,
@@ -1434,6 +1483,7 @@ internal sealed class MainForm : Form
 
     private void ShowMenu()
     {
+        if (_fullscreen) ToggleFullscreen();
         if (_tabs == null)
         {
             return;
@@ -1444,7 +1494,7 @@ internal sealed class MainForm : Form
             new()
             {
                 Text = "新建标签页", Shortcut = "Ctrl+T",
-                Action = () => _tabs.NewTab(UrlUtils.InternalHome),
+                Action = OpenNewTab,
             },
             new()
             {
@@ -1724,8 +1774,14 @@ internal sealed class MainForm : Form
         _settings.Save();
         Theme.Scale = steps[index];
         Theme.RefreshFonts();
-        ApplyScaledMetrics();
+        ApplyMetricsToWindows();
         SetStatus($"界面已放大到 {steps[index] * 100:0}%");
+    }
+
+    private static void ApplyMetricsToWindows()
+    {
+        foreach (var window in Application.OpenForms.Cast<Form>().OfType<MainForm>().ToArray())
+            if (!window.IsDisposed) window.ApplyScaledMetrics();
     }
 
     private void ReclaimMemory()
@@ -1861,7 +1917,7 @@ internal sealed class MainForm : Form
         Theme.Scale = Math.Clamp(_settings.UiScale, 1.0f, 1.6f);
         Theme.SetMode((ThemeMode)Math.Clamp(_settings.ThemeMode, 0, 2));
         Theme.RefreshFonts();
-        ApplyScaledMetrics();
+        ApplyMetricsToWindows();
         ApplyPageTheme();
 
         if (result == DialogResult.OK)
@@ -1898,9 +1954,12 @@ internal sealed class MainForm : Form
 
     private void ShowFindBar()
     {
+        if (_fullscreen) ToggleFullscreen();
         _findBar.Visible = true;
         _findInput.Focus();
         _findInput.SelectAll();
+        _findFirstMatch = true;
+        FindNext(true);
     }
 
     private void HideFindBar()
@@ -1909,7 +1968,7 @@ internal sealed class MainForm : Form
         _findFirstMatch = true;
         _findCount.Text = "";
         _tabs?.Active?.Find("", true, true);
-        _viewHost.Focus();
+        FocusPage();
     }
 
     private void FindNext(bool forward)
@@ -1922,19 +1981,31 @@ internal sealed class MainForm : Form
         string text = _findInput.Text;
         tab.Find(text, forward, _findFirstMatch);
         _findFirstMatch = false;
-        _findCount.Text = string.IsNullOrEmpty(text) ? "" : (forward ? "↓" : "↑");
+        if (string.IsNullOrEmpty(text)) _findCount.Text = "";
     }
 
     // ================================================================ 键盘
 
+    protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+    {
+        if (BrowserShortcuts.Contains(keyData))
+        {
+            var args = new KeyEventArgs(keyData);
+            OnFormKeyDown(this, args);
+            if (args.Handled) return true;
+        }
+        return base.ProcessCmdKey(ref msg, keyData);
+    }
+
     private void OnFormKeyDown(object sender, KeyEventArgs e)
     {
+        if (_closing || !BrowserShortcuts.Contains(e.KeyData)) return;
         bool ctrl = e.Control;
         bool shift = e.Shift;
 
         if (ctrl && e.KeyCode == Keys.T && !shift)
         {
-            _tabs?.NewTab(UrlUtils.InternalHome);
+            OpenNewTab();
             e.Handled = true;
         }
         else if (ctrl && e.KeyCode == Keys.T && shift)
@@ -1970,8 +2041,10 @@ internal sealed class MainForm : Form
             OpenNewWindow();
             e.Handled = true;
         }
-        else if (ctrl && e.KeyCode == Keys.L)
+        else if ((ctrl && e.KeyCode == Keys.L) || (e.Alt && e.KeyCode == Keys.D) || e.KeyCode == Keys.F6)
         {
+            if (_fullscreen) ToggleFullscreen();
+            Activate();
             _address.Focus();
             _address.SelectAll();
             e.Handled = true;
@@ -2006,20 +2079,25 @@ internal sealed class MainForm : Form
             CycleTab(-1);
             e.Handled = true;
         }
-        else if (ctrl && e.KeyCode == Keys.Oemplus)
+        else if (ctrl && (e.KeyCode == Keys.Oemplus || e.KeyCode == Keys.Add))
         {
-            // Ctrl+= 放大界面，Ctrl+0 复位，方便高分屏用户自己调
-            NextUiScale();
+            AdjustZoom(0.1);
             e.Handled = true;
         }
-        else if (ctrl && e.KeyCode == Keys.D0)
+        else if (ctrl && (e.KeyCode == Keys.OemMinus || e.KeyCode == Keys.Subtract))
         {
-            _settings.UiScale = 1.15f;
-            _settings.Save();
-            Theme.Scale = 1.15f;
-            Theme.RefreshFonts();
-            ApplyScaledMetrics();
-            SetStatus("界面倍率已复位");
+            AdjustZoom(-0.1);
+            e.Handled = true;
+        }
+        else if (ctrl && (e.KeyCode == Keys.D0 || e.KeyCode == Keys.NumPad0))
+        {
+            _tabs?.Active?.SetZoom(1.0);
+            SetStatus("网页缩放 100%");
+            e.Handled = true;
+        }
+        else if (ctrl && e.KeyCode >= Keys.D1 && e.KeyCode <= Keys.D9)
+        {
+            _tabs?.Activate(e.KeyCode == Keys.D9 ? _tabs.Count - 1 : e.KeyCode - Keys.D1);
             e.Handled = true;
         }
         else if (ctrl && e.KeyCode == Keys.J)
@@ -2037,6 +2115,16 @@ internal sealed class MainForm : Form
             OpenInternalPage(InternalPages.BookmarksUrl);
             e.Handled = true;
         }
+        else if (ctrl && shift && e.KeyCode == Keys.C)
+        {
+            CopyCurrentUrl();
+            e.Handled = true;
+        }
+        else if (e.Alt && e.KeyCode == Keys.F)
+        {
+            ShowMenu();
+            e.Handled = true;
+        }
         else if (e.KeyCode == Keys.F5)
         {
             Reload();
@@ -2049,7 +2137,17 @@ internal sealed class MainForm : Form
         }
         else if (e.KeyCode == Keys.Escape)
         {
-            if (_findBar.Visible)
+            if (_address.Focused)
+            {
+                _addressDirty = false;
+                UpdateChrome();
+                FocusPage();
+            }
+            else if (_fullscreen)
+            {
+                ToggleFullscreen();
+            }
+            else if (_findBar.Visible)
             {
                 HideFindBar();
             }
@@ -2073,11 +2171,7 @@ internal sealed class MainForm : Form
             GoForward();
             e.Handled = true;
         }
-        else if (ctrl && (e.KeyCode == Keys.Add || e.KeyCode == Keys.Subtract))
-        {
-            AdjustZoom(e.KeyCode == Keys.Add ? 0.1 : -0.1);
-            e.Handled = true;
-        }
+        if (e.Handled) e.SuppressKeyPress = true;
     }
 
     private void CycleTab(int delta)
@@ -2090,25 +2184,53 @@ internal sealed class MainForm : Form
         _tabs.Activate(index);
     }
 
-    private double _zoom = 1.0;
-
     private void AdjustZoom(double delta)
     {
-        _zoom = Math.Clamp(_zoom + delta, 0.25, 5.0);
-        _tabs?.Active?.SetZoom(_zoom);
-        SetStatus($"网页缩放 {_zoom * 100:0}%");
+        if (_tabs?.Active is not { } tab) return;
+        tab.SetZoom(Math.Round(tab.ZoomFactor + delta, 2));
+        SetStatus($"网页缩放 {tab.ZoomFactor * 100:0}%");
     }
 
     private bool _fullscreen;
+    private bool _manualFullscreen;
+    private bool _pageFullscreen;
+    private bool _findBeforeFullscreen;
+    private FormWindowState _stateBeforeFullscreen;
+    private Rectangle _boundsBeforeFullscreen;
 
     private void ToggleFullscreen()
     {
-        _fullscreen = !_fullscreen;
+        _manualFullscreen = !_fullscreen;
+        if (!_manualFullscreen && _pageFullscreen)
+        {
+            _pageFullscreen = false;
+            _ = ExitPageFullscreenAsync();
+        }
+        SetFullscreen(_manualFullscreen || _pageFullscreen);
+    }
+
+    private async Task ExitPageFullscreenAsync()
+    {
+        try { if (_tabs?.Active?.View?.Engine is { } view) await view.ExecuteScriptAsync("if(document.fullscreenElement) document.exitFullscreen(); true"); }
+        catch (Exception ex) { Log.Warn("退出网页全屏失败: " + ex.Message); }
+    }
+
+    private void SetFullscreen(bool fullscreen)
+    {
+        if (_fullscreen == fullscreen) return;
+        _fullscreen = fullscreen;
+        SuspendLayout();
         if (_fullscreen)
         {
+            _stateBeforeFullscreen = WindowState;
+            _boundsBeforeFullscreen = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
+            _findBeforeFullscreen = _findBar.Visible;
             FormBorderStyle = FormBorderStyle.None;
             WindowState = FormWindowState.Maximized;
             _toolbar.Visible = false;
+            _tabStrip.Visible = false;
+            _findBar.Visible = false;
+            _sidebar.Visible = false;
             _progressHost.Visible = false;
             _status.Visible = false;
         }
@@ -2116,10 +2238,17 @@ internal sealed class MainForm : Form
         {
             FormBorderStyle = FormBorderStyle.Sizable;
             WindowState = FormWindowState.Normal;
+            Bounds = _boundsBeforeFullscreen;
+            WindowState = _stateBeforeFullscreen;
             _toolbar.Visible = true;
+            _tabStrip.Visible = true;
+            _findBar.Visible = _findBeforeFullscreen;
+            _sidebar.Visible = _sidebarShown;
             _progressHost.Visible = true;
             _status.Visible = true;
         }
+        ResumeLayout(true);
+        FocusPage();
     }
 
     private void OnAddressKeyDown(object sender, KeyEventArgs e)
@@ -2134,7 +2263,7 @@ internal sealed class MainForm : Form
         {
             _addressDirty = false;
             UpdateChrome();
-            _viewHost.Focus();
+            FocusPage();
             e.Handled = true;
             e.SuppressKeyPress = true;
         }
@@ -2266,14 +2395,16 @@ internal sealed class MainForm : Form
 
         _settings.SessionUrls = _tabs.Tabs.Select(t => t.Url).ToList();
         _settings.SessionActiveIndex = _tabs.ActiveIndex;
-        if (WindowState == FormWindowState.Normal)
+        FormWindowState savedState = _fullscreen ? _stateBeforeFullscreen : WindowState;
+        Size savedSize = _fullscreen ? _boundsBeforeFullscreen.Size : Size;
+        if (savedState == FormWindowState.Normal)
         {
             // 存的是逻辑尺寸，换到别的 DPI 屏幕上恢复时不会过大。
-            _settings.WindowWidth = (int)Math.Round(Width / (Theme.DpiScale * Theme.Scale) * 1.15f);
-            _settings.WindowHeight = (int)Math.Round(Height / (Theme.DpiScale * Theme.Scale) * 1.15f);
+            _settings.WindowWidth = (int)Math.Round(savedSize.Width / (Theme.DpiScale * Theme.Scale) * 1.15f);
+            _settings.WindowHeight = (int)Math.Round(savedSize.Height / (Theme.DpiScale * Theme.Scale) * 1.15f);
             _settings.WindowMaximized = false;
         }
-        else if (WindowState == FormWindowState.Maximized)
+        else if (savedState == FormWindowState.Maximized)
         {
             _settings.WindowMaximized = true;
         }

@@ -53,32 +53,20 @@ internal sealed class SettingsDialog : Form
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
         root.Controls.Add(BuildHeader(), 0, 0);
-        root.Controls.Add(BuildBody(), 0, 1);
+        var scroll = new Panel { Dock = DockStyle.Fill, AutoScroll = true, Margin = Padding.Empty };
+        scroll.Controls.Add(BuildBody());
+        root.Controls.Add(scroll, 0, 1);
         root.Controls.Add(BuildFooter(), 0, 2);
         Controls.Add(root);
 
-        AutoSize = true;
-        AutoSizeMode = AutoSizeMode.GrowAndShrink;
-        MinimumSize = new Size(Theme.Sx(600), Theme.Sy(620));
+        ClientSize = new Size(Theme.Sx(660), Theme.Sy(660));
+        MinimumSize = new Size(320, 240);
         LoadValues();
 
         Theme.ApplyTo(this);
         Theme.Changed += OnThemeChanged;
         FormClosed += (_, _) => Theme.Changed -= OnThemeChanged;
 
-        // AutoSize + Dock=Fill 的组合在自动测量上偶尔会算小，导致底部按钮被裁掉。
-        // 显示之前按内容实际需要的尺寸再兜一次，保证「保存/取消」一定看得见。
-        Shown += (_, _) =>
-        {
-            int neededWidth = Theme.Sx(600);
-            int neededHeight = Theme.Sy(620);
-            if (ClientSize.Width < neededWidth || ClientSize.Height < neededHeight)
-            {
-                ClientSize = new Size(
-                    Math.Max(ClientSize.Width, neededWidth),
-                    Math.Max(ClientSize.Height, neededHeight));
-            }
-        };
     }
 
     /// <summary>主题变化时立刻重新上色，让用户在设置里能马上看到效果。</summary>
@@ -100,6 +88,7 @@ internal sealed class SettingsDialog : Form
     protected override void OnShown(EventArgs e)
     {
         base.OnShown(e);
+        WindowChrome.FitDialog(this, Screen.FromControl(Owner ?? this).WorkingArea);
         WindowChrome.ApplyDarkTitleBar(this, Theme.Dark);
     }
 
@@ -120,11 +109,22 @@ internal sealed class SettingsDialog : Form
     {
         var grid = new TableLayoutPanel
         {
-            Dock = DockStyle.Fill,
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
             ColumnCount = 2,
         };
-        grid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Theme.Sx(200)));
-        grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 35));
+        grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 65));
+        grid.SizeChanged += (_, _) =>
+        {
+            foreach (Control child in grid.Controls)
+            {
+                int width = grid.GetColumnSpan(child) == 2 ? grid.ClientSize.Width :
+                    (int)(grid.ClientSize.Width * (grid.GetColumn(child) == 0 ? .35 : .65));
+                if (child is Label || child is CheckBox) child.MaximumSize = new Size(Math.Max(1, width - child.Margin.Horizontal), 0);
+            }
+        };
 
         int row = 0;
         _homePage.PlaceholderText = "留空则打开内置首页";
@@ -267,6 +267,7 @@ internal sealed class SettingsDialog : Form
         }, 0, row);
 
         field.Font = Theme.UiFont;
+        field.Dock = DockStyle.Top;
         field.Width = width;
         field.Height = height;
         field.Margin = new Padding(0, Theme.Sy(7), 0, Theme.Sy(7));

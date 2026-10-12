@@ -467,6 +467,9 @@ public sealed class BrowserTab : IDisposable
         try
         {
             View?.Engine?.Stop();
+            IsLoading = false;
+            Progress = 0;
+            RaiseChanged();
         }
         catch
         {
@@ -475,6 +478,7 @@ public sealed class BrowserTab : IDisposable
     }
 
     private double _zoomFactor = 1.0;
+    public double ZoomFactor => _zoomFactor;
 
     public void SetZoom(double factor)
     {
@@ -522,7 +526,16 @@ public sealed class BrowserTab : IDisposable
             string title = e.Title;
             view.Ui(() => { if (OwnsView(view)) { Title = title; RaiseChanged(); } });
         };
-        view.LoadingStateChanged += (_, _) => view.Ui(() => { if (OwnsView(view)) RaiseChanged(); });
+        view.LoadingStateChanged += (_, e) =>
+        {
+            bool loading = e.IsLoading;
+            view.Ui(() =>
+            {
+                if (!OwnsView(view)) return;
+                if (!loading) IsLoading = false;
+                RaiseChanged();
+            });
+        };
         view.FrameLoadEnd += (_, e) =>
         {
             if (!e.Frame.IsMain) return;
@@ -604,6 +617,11 @@ public sealed class BrowserTab : IDisposable
         try
         {
             string source = view.Engine?.Source;
+            if (source == BrowserView.HomeAddress)
+            {
+                Url = UrlUtils.InternalHome;
+                return;
+            }
             // NavigateToString 之后 Source 会变成 about:blank，此时应保留原来的
             // feather://home 标记，否则首页会被误判成真实网页。
             if (string.IsNullOrEmpty(source) ||

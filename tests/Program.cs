@@ -15,12 +15,14 @@ internal static class Program
     private static readonly List<string> Results = new();
     private static int _failures;
     private static bool _completed;
+    private static string? _filter;
 
     [STAThread]
     private static int Main(string[] args)
     {
         int subprocessExit = CefSharp.BrowserSubprocess.SelfHost.Main(args);
         if (subprocessExit >= 0) return subprocessExit;
+        _filter = args.FirstOrDefault(a => a.StartsWith("--filter="))?[9..];
         string root = Path.Combine(Path.GetTempPath(), "FeatherRegression_" + Guid.NewGuid().ToString("N"));
         AppPaths.OverrideRoot(root);
         AppPaths.EnsureCreated();
@@ -52,6 +54,34 @@ internal static class Program
 
     private static async Task RunAsync(Form form)
     {
+        await Check("Interaction: dragging a tab commits its new position", () =>
+        {
+            using var strip = new TabStrip { Size = new Size(800, Theme.Sy(38)) };
+            form.Controls.Add(strip);
+            var tabs = Enumerable.Range(0, 3).Select(i => new BrowserTab(null!, "https://example.com/" + i, false)).ToArray();
+            strip.Update(tabs, 0);
+            int from = -1, to = -1;
+            strip.MoveTab = (a, b) => { from = a; to = b; };
+            int y = strip.Height / 2;
+            Call(strip, "OnMouseDown", new MouseEventArgs(MouseButtons.Left, 1, 40, y, 0));
+            Call(strip, "OnMouseMove", new MouseEventArgs(MouseButtons.Left, 0, 730, y, 0));
+            Call(strip, "OnMouseUp", new MouseEventArgs(MouseButtons.Left, 1, 730, y, 0));
+            Equal(0, from);
+            Equal(2, to);
+            return Task.CompletedTask;
+        });
+        await Check("Interaction: overflowing tabs keep the active tab and new button reachable before painting", () =>
+        {
+            using var strip = new TabStrip { Size = new Size(650, Theme.Sy(38)) };
+            var tabs = Enumerable.Range(0, 24).Select(i => new BrowserTab(null!, "https://example.com/" + i, false)).ToArray();
+            strip.Update(tabs, 23);
+            int y = strip.Height / 2;
+            Require(Enumerable.Range(0, strip.Width).Any(x => strip.DescribeHit(new Point(x, y)).Contains("第 23 个标签")), "Active tab is outside the viewport");
+            Require(strip.DescribeHit(new Point(strip.Width - Theme.Sx(15), y)).Contains("新建标签按钮"));
+            strip.Width = 450;
+            Require(strip.DescribeHit(new Point(strip.Width - Theme.Sx(15), y)).Contains("新建标签按钮"), "New button hit region is stale after resizing");
+            return Task.CompletedTask;
+        });
         await Check("Address recognition uses the host and preserves internal/file URLs", () =>
         {
             string template = "https://search.test/?q=%s";
@@ -101,6 +131,170 @@ internal static class Program
         });
 
         using var server = new TestServer();
+        await Check("Interaction: memory statistics occupy separate visible rows", async () =>
+        {
+            await WithWindow(server.Url + "memory", window =>
+            {
+                using var dialog = new MemoryDialog(GetTabs(window)!, new AppSettings(), () => { });
+                dialog.StartPosition = FormStartPosition.Manual;
+                dialog.Location = form.Location;
+                dialog.Show(form);
+                var labels = new[] { "_systemLabel", "_appLabel", "_kernelLabel", "_tabLabel", "_verdictLabel" }.Select(n => Field<Label>(dialog, n)).ToArray();
+                for (int i = 1; i < labels.Length; i++)
+                    Require(labels[i].Top >= labels[i - 1].Bottom, "Memory statistics overlap or are out of order");
+                dialog.Close();
+                return Task.CompletedTask;
+            });
+        });
+        await Check("Interaction: native webpage keyboard focus routes browser shortcuts exactly once", async () =>
+        {
+            await WithWindow(server.Url + "keyboard", async window =>
+            {
+                var tabs = GetTabs(window)!;
+                var view = tabs.Active.View;
+                await view.ExecuteScriptAsync("window.shortcutLeaks=0; document.addEventListener('keydown', e=>{if(e.ctrlKey&&e.key.toLowerCase()==='t') window.shortcutLeaks++})");
+                using var host = CefSharp.WebBrowserExtensions.GetBrowserHost(view);
+                host.SendKeyEvent(new CefSharp.KeyEvent { Type = CefSharp.KeyEventType.RawKeyDown, WindowsKeyCode = (int)Keys.T, Modifiers = CefSharp.CefEventFlags.ControlDown });
+                host.SendKeyEvent(new CefSharp.KeyEvent { Type = CefSharp.KeyEventType.KeyUp, WindowsKeyCode = (int)Keys.T, Modifiers = CefSharp.CefEventFlags.ControlDown });
+                await Until(() => tabs.Count == 2);
+                await Loaded(tabs.Active);
+                await Task.Delay(150);
+                Equal(2, tabs.Count);
+                tabs.Activate(0);
+                Equal("0", await view.ExecuteScriptAsync("shortcutLeaks"));
+                host.SendKeyEvent(new CefSharp.KeyEvent { Type = CefSharp.KeyEventType.RawKeyDown, WindowsKeyCode = (int)Keys.L, Modifiers = CefSharp.CefEventFlags.ControlDown });
+                var address = Field<TextBox>(window, "_address");
+                await Until(() => address.Focused);
+                Equal(address.Text.Length, address.SelectionLength);
+            });
+        });
+        await Check("Interaction: fullscreen hides all chrome and restores the previous window and sidebar", async () =>
+        {
+            await WithWindow(server.Url + "fullscreen", window =>
+            {
+                window.WindowState = FormWindowState.Maximized;
+                Call(window, "ToggleSidebar");
+                Call(window, "ShowFindBar");
+                Call(window, "ToggleFullscreen");
+                foreach (string name in new[] { "_toolbar", "_tabStrip", "_findBar", "_progressHost", "_sidebar", "_status" })
+                    Require(!Field<Control>(window, name).Visible, name + " remains over fullscreen content");
+                Equal(window.ClientSize, Field<Panel>(window, "_viewHost").Size);
+                Call(window, "ToggleFullscreen");
+                Equal(FormWindowState.Maximized, window.WindowState);
+                Require(Field<Control>(window, "_sidebar").Visible && Field<Control>(window, "_findBar").Visible);
+                AssertBrowserLayout(window);
+                return Task.CompletedTask;
+            });
+        });
+        await Check("Interaction: address editing, tab switching, Escape and page zoom stay consistent", async () =>
+        {
+            await WithWindow(server.Url + "address-first", async window =>
+            {
+                var tabs = GetTabs(window)!;
+                var first = tabs.Active;
+                Call(window, "OpenNewTab");
+                await Loaded(tabs.Active);
+                var address = Field<TextBox>(window, "_address");
+                Require(address.Focused, "Homepage load stole the address field focus");
+                address.Text = "unfinished search";
+                tabs.Activate(first);
+                Equal(UrlUtils.PrettyForBar(first.Url), address.Text);
+                Call(window, "OnFormKeyDown", window, new KeyEventArgs(Keys.Control | Keys.Oemplus));
+                Equal(1.1, first.ZoomFactor);
+                float uiScale = Theme.Scale;
+                Call(window, "OnFormKeyDown", window, new KeyEventArgs(Keys.Control | Keys.D0));
+                Equal(1.0, first.ZoomFactor);
+                Equal(uiScale, Theme.Scale);
+                address.Text = "discard this edit";
+                Call(window, "OnFormKeyDown", window, new KeyEventArgs(Keys.Escape));
+                Equal(UrlUtils.PrettyForBar(first.Url), address.Text);
+                Require(first.View.ContainsFocus, "Escape did not restore page focus");
+                Call(window, "OnFormKeyDown", window, new KeyEventArgs(Keys.Control | Keys.L));
+                address.Text = server.Url + "address-second";
+                Call(window, "OnAddressKeyDown", address, new KeyEventArgs(Keys.Enter));
+                await Loaded(first);
+                Equal(server.Url + "address-second", first.Url);
+                Require(first.View.ContainsFocus, "Navigation did not restore page focus");
+            });
+        });
+        await Check("Interaction: website fullscreen follows native requests and browser commands expose the chrome", async () =>
+        {
+            await WithWindow(server.Url + "video-fullscreen", async window =>
+            {
+                var tab = GetTabs(window)!.Active;
+                await tab.View.ExecuteScriptAsync("document.body.innerHTML='<button style=\"width:150px;height:60px\">Fullscreen</button>';document.querySelector('button').onclick=()=>document.documentElement.requestFullscreen();true");
+                using var host = CefSharp.WebBrowserExtensions.GetBrowserHost(tab.View);
+                host.SendMouseClickEvent(new CefSharp.MouseEvent(30, 30, CefSharp.CefEventFlags.None), CefSharp.MouseButtonType.Left, false, 1);
+                host.SendMouseClickEvent(new CefSharp.MouseEvent(30, 30, CefSharp.CefEventFlags.None), CefSharp.MouseButtonType.Left, true, 1);
+                await Until(() => Field<bool>(window, "_fullscreen"));
+                Require(!Field<TabStrip>(window, "_tabStrip").Visible);
+                await tab.View.ExecuteScriptAsync("document.exitFullscreen(); true");
+                await Until(() => !Field<bool>(window, "_fullscreen"));
+                Call(window, "ToggleFullscreen");
+                Call(window, "OnFormKeyDown", window, new KeyEventArgs(Keys.Control | Keys.L));
+                Require(!Field<bool>(window, "_fullscreen") && Field<TextBox>(window, "_address").Focused);
+            });
+        });
+        await Check("Interaction: history navigation to home clears the address and native find shows match counts", async () =>
+        {
+            await WithWindow(server.Url + "find-first", async window =>
+            {
+                var tabs = GetTabs(window)!;
+                var tab = tabs.Active;
+                tab.NavigateTo(UrlUtils.InternalHome);
+                await Loaded(tab);
+                tab.NavigateTo(server.Url + "find-second");
+                await Loaded(tab);
+                tab.GoBack();
+                await Until(() => tab.View.Source == BrowserView.HomeAddress && tab.IsHomePage && !tab.IsLoading);
+                Equal("", Field<TextBox>(window, "_address").Text);
+                tab.GoForward();
+                await Until(() => tab.Url == server.Url + "find-second" && tab.LastNavigationSucceeded == true);
+                Call(window, "ShowFindBar");
+                var input = Field<TextBox>(window, "_findInput");
+                var count = Field<Label>(window, "_findCount");
+                input.Text = "Test page";
+                await Until(() => count.Text == "1/1" || count.Text == "共 1 处");
+                input.Text = "missing phrase";
+                await Until(() => count.Text == "0/0");
+                Call(window, "HideFindBar");
+                Require(tab.View.ContainsFocus);
+            });
+        });
+        await Check("Interaction: settings and memory dialogs fit small screens with reachable fixed buttons", async () =>
+        {
+            await WithWindow(server.Url + "dialogs", window =>
+            {
+                float original = Theme.Scale;
+                try
+                {
+                    Theme.Scale = 1.5f;
+                    Theme.RefreshFonts();
+                    using var settings = new SettingsDialog(new AppSettings());
+                    using var memory = new MemoryDialog(GetTabs(window)!, new AppSettings(), () => { });
+                    foreach (Form dialog in new Form[] { settings, memory })
+                    {
+                        dialog.Show(window);
+                        var area = new Rectangle(-640, 0, 640, 480);
+                        WindowChrome.FitDialog(dialog, area);
+                        Require(area.Contains(dialog.Bounds), "Dialog extends outside the working area");
+                        foreach (Button button in Descendants(dialog).OfType<Button>())
+                            Require(dialog.RectangleToScreen(dialog.ClientRectangle).Contains(button.RectangleToScreen(button.ClientRectangle)), button.Text + " is clipped");
+                        var scroll = Descendants(dialog).OfType<Panel>().Single(p => p.AutoScroll);
+                        Require(scroll.VerticalScroll.Visible, "Long content has no scrollbar");
+                        Control target = dialog == settings ? Field<Control>(settings, "_maxLiveTabs") : Field<Control>(memory, "_maxLive");
+                        scroll.ScrollControlIntoView(target);
+                        Require(scroll.RectangleToScreen(scroll.ClientRectangle).Contains(target.RectangleToScreen(target.ClientRectangle)), dialog.Text + ": " + scroll.RectangleToScreen(scroll.ClientRectangle) + " does not contain " + target.RectangleToScreen(target.ClientRectangle));
+                        using var screenshot = new Bitmap(dialog.Width, dialog.Height);
+                        dialog.DrawToBitmap(screenshot, new Rectangle(Point.Empty, dialog.Size));
+                        screenshot.Save(Path.Combine(AppPaths.Root, dialog == settings ? "interaction-settings.png" : "interaction-memory.png"));
+                        dialog.Close();
+                    }
+                }
+                finally { Theme.Scale = original; Theme.RefreshFonts(); }
+                return Task.CompletedTask;
+            });
+        });
         await Check("Theme font refresh preserves controls and existing font references", () =>
         {
             using var probe = new Form { ShowInTaskbar = false, Location = new Point(-32000, -32000), StartPosition = FormStartPosition.Manual };
@@ -127,11 +321,13 @@ internal static class Program
         {
             await Check("Homepage remains internal and does not enter history", async () =>
             {
+                int historyBefore = tabs.History.Count;
                 var tab = tabs.NewTab(UrlUtils.InternalHome);
                 await Loaded(tab);
                 Require(tab.IsHomePage);
                 Equal(UrlUtils.InternalHome, tab.Url);
-                Require(tabs.History.Count == 0);
+                Equal(historyBefore, tabs.History.Count);
+                Require(!tabs.History.Snapshot().Any(h => UrlUtils.IsHome(h.Url)));
 
                 string oldTemplate = tabs.Settings.Engine.Template;
                 try
@@ -328,6 +524,33 @@ internal static class Program
                 }
                 finally { Theme.Scale = original; Theme.RefreshFonts(); }
                 return Task.CompletedTask;
+            });
+        });
+        await Check("Interaction: native Chromium window matches the viewport at every UI scale with sidebar and find open", async () =>
+        {
+            await WithWindow(server.Url + "native-layout", async window =>
+            {
+                float original = Theme.Scale;
+                try
+                {
+                    using var browserHost = CefSharp.WebBrowserExtensions.GetBrowserHost(GetTabs(window)!.Active.View);
+                    foreach (float scale in new[] { 1f, 1.15f, 1.3f, 1.5f })
+                    {
+                        Theme.Scale = scale;
+                        Theme.RefreshFonts();
+                        Call(window, "ApplyScaledMetrics");
+                        window.Size = window.MinimumSize;
+                        foreach (bool open in new[] { true, false })
+                        {
+                            Call(window, "ToggleSidebar");
+                            if (open) Call(window, "ShowFindBar"); else Call(window, "HideFindBar");
+                            AssertBrowserLayout(window);
+                            var host = Field<Panel>(window, "_viewHost");
+                            await Until(() => NativeProbe.Bounds(browserHost.GetWindowHandle()) == host.RectangleToScreen(host.ClientRectangle));
+                        }
+                    }
+                }
+                finally { Theme.Scale = original; Theme.RefreshFonts(); }
             });
         });
 
@@ -637,6 +860,8 @@ internal static class Program
     private static T Field<T>(object instance, string name) =>
         (T)instance.GetType().GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(instance)!;
 
+    private static IEnumerable<Control> Descendants(Control parent) => parent.Controls.Cast<Control>().SelectMany(c => new[] { c }.Concat(Descendants(c)));
+
     private static void Call(object instance, string method, params object[] args) =>
         instance.GetType().GetMethod(method, BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(instance, args);
 
@@ -702,6 +927,7 @@ internal static class Program
 
     private static async Task Check(string name, Func<Task> action)
     {
+        if (_filter != null && !name.Contains(_filter, StringComparison.OrdinalIgnoreCase)) return;
         Console.WriteLine("RUN " + name);
         try { await action(); Results.Add("PASS " + name); }
         catch (Exception ex) { Fail(name, ex); }
@@ -726,6 +952,16 @@ internal sealed class FindProbe(Action<int> report) : CefSharp.Handler.FindHandl
     protected override void OnFindResult(CefSharp.IWebBrowser chromiumWebBrowser, CefSharp.IBrowser browser,
         int identifier, int count, CefSharp.Structs.Rect selectionRect, int activeMatchOrdinal, bool finalUpdate)
     { if (finalUpdate) report(count); }
+}
+
+internal static class NativeProbe
+{
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct Rect { public int Left, Top, Right, Bottom; }
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool GetWindowRect(IntPtr window, out Rect rect);
+    internal static Rectangle Bounds(IntPtr window) => GetWindowRect(window, out var r)
+        ? Rectangle.FromLTRB(r.Left, r.Top, r.Right, r.Bottom) : Rectangle.Empty;
 }
 
 internal sealed class TestServer : IDisposable

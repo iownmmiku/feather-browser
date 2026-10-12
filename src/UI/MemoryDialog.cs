@@ -44,15 +44,17 @@ internal sealed class MemoryDialog : Form
 
         var root = new TableLayoutPanel
         {
-            Dock = DockStyle.Fill,
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
             ColumnCount = 1,
-            RowCount = 6,
+            RowCount = 7,
         };
-        for (int i = 0; i < 5; i++)
+        root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        for (int i = 0; i < 7; i++)
         {
             root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         }
-        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
 
         var title = new Label
         {
@@ -65,6 +67,7 @@ internal sealed class MemoryDialog : Form
         };
         root.Controls.Add(title, 0, 0);
 
+        int row = 1;
         foreach (Label label in new[] { _systemLabel, _appLabel, _kernelLabel, _tabLabel })
         {
             label.AutoSize = true;
@@ -72,7 +75,8 @@ internal sealed class MemoryDialog : Form
             label.BackColor = Color.Transparent;
             label.Font = Theme.UiFont;
             label.Margin = new Padding(0, Theme.Sy(5), 0, Theme.Sy(5));
-            root.Controls.Add(label, 0, 1);
+            label.MaximumSize = new Size(Theme.Sx(550), 0);
+            root.Controls.Add(label, 0, row++);
         }
 
         _verdictLabel.AutoSize = true;
@@ -81,7 +85,7 @@ internal sealed class MemoryDialog : Form
         _verdictLabel.Font = Theme.UiFontSmall;
         _verdictLabel.MaximumSize = new Size(Theme.Sx(560), 0);
         _verdictLabel.Margin = new Padding(0, Theme.Sy(16), 0, 0);
-        root.Controls.Add(_verdictLabel, 0, 2);
+        root.Controls.Add(_verdictLabel, 0, 5);
 
         // 滑块：调「同时渲染标签数」
         var sliderGroup = new GroupBox
@@ -121,12 +125,12 @@ internal sealed class MemoryDialog : Form
             UpdateLabels();
         };
         sliderGroup.Controls.Add(_maxLive);
-        root.Controls.Add(sliderGroup, 0, 3);
+        root.Controls.Add(sliderGroup, 0, 6);
 
         var buttons = new FlowLayoutPanel
         {
             FlowDirection = FlowDirection.LeftToRight,
-            Dock = DockStyle.Fill,
+            Dock = DockStyle.Bottom,
             AutoSize = true,
             BackColor = Theme.Background,
             Margin = new Padding(0, Theme.Sy(14), 0, 0),
@@ -134,8 +138,9 @@ internal sealed class MemoryDialog : Form
 
         var reclaim = new Button
         {
-            Text = "立即回收后台标签内存",
-            Width = Theme.Sx(240),
+            Text = "回收后台标签内存",
+            Font = Theme.UiFontSmall,
+            Width = Theme.Sx(190),
             Height = Theme.Sy(38),
             FlatStyle = FlatStyle.System,
         };
@@ -149,7 +154,8 @@ internal sealed class MemoryDialog : Form
         var close = new Button
         {
             Text = "关闭",
-            Width = Theme.Sx(110),
+            Font = Theme.UiFontSmall,
+            Width = Theme.Sx(70),
             Height = Theme.Sy(38),
             FlatStyle = FlatStyle.System,
             DialogResult = DialogResult.OK,
@@ -160,16 +166,19 @@ internal sealed class MemoryDialog : Form
         // 想核对真实占用（以及单独结束某个进程看会发生什么）都从这里去。
         var taskManager = new Button
         {
-            Text = "打开任务管理器",
-            Width = Theme.Sx(170),
+            Text = "任务管理器",
+            Font = Theme.UiFontSmall,
+            Width = Theme.Sx(100),
             Height = Theme.Sy(38),
             FlatStyle = FlatStyle.System,
         };
         taskManager.Click += (_, _) => OpenTaskManager();
         buttons.Controls.Add(taskManager);
-        root.Controls.Add(buttons, 0, 4);
-
-        Controls.Add(root);
+        var scroll = new Panel { Dock = DockStyle.Fill, AutoScroll = true };
+        scroll.Controls.Add(root);
+        Controls.Add(scroll);
+        Controls.Add(buttons);
+        CancelButton = close;
 
         Theme.ApplyTo(this);
         Theme.Changed += OnThemeChanged;
@@ -196,6 +205,7 @@ internal sealed class MemoryDialog : Form
     protected override void OnShown(EventArgs e)
     {
         base.OnShown(e);
+        WindowChrome.FitDialog(this, Screen.FromControl(Owner ?? this).WorkingArea);
         WindowChrome.ApplyDarkTitleBar(this, Theme.Dark);
     }
 
@@ -247,7 +257,7 @@ internal sealed class MemoryDialog : Form
             MemoryMonitor.Mb(perTab) + "。\r\n" +
             "把上限调小，多余的标签会被休眠（销毁渲染进程），只保留网址，因此标签开到几十个，\r\n" +
             "内存也不会线性增长。代价是切回休眠标签时需要重新加载一次页面。\r\n" +
-            "提示：在任务管理器里结束本程序的任何一个 msedgewebview2 子进程，\r\n" +
+            "提示：在任务管理器里结束本程序的网页渲染子进程，\r\n" +
             "对应标签会自动重新加载，不会留下白屏的死状态。";
     }
 

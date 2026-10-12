@@ -41,6 +41,16 @@ public sealed class TabManager
 
     /// <summary>需要打开新窗口（window.open）。</summary>
     public event Action<string> NewWindowRequested;
+    internal event Action<Keys> ShortcutRequested;
+    internal event Action<bool> FullscreenRequested;
+    internal event Action<BrowserTab> NavigationCompleted;
+    internal event Action<int, int> FindResult;
+    internal void NotifyFindResult(BrowserTab tab, int ordinal, int count)
+    { if (!_shutdown && Active == tab) FindResult?.Invoke(ordinal, count); }
+    internal void NotifyShortcut(BrowserTab tab, Keys keys)
+    { if (!_shutdown && Active == tab) ShortcutRequested?.Invoke(keys); }
+    internal void NotifyFullscreen(BrowserTab tab, bool fullscreen)
+    { if (!_shutdown && Active == tab) FullscreenRequested?.Invoke(fullscreen); }
 
     public AppSettings Settings { get; }
 
@@ -580,6 +590,7 @@ public sealed class TabManager
 
     internal void NotifyNavigationCompleted(BrowserTab tab)
     {
+        NavigationCompleted?.Invoke(tab);
         // 记录历史（首页不记）
         if (!IsIncognito && !UrlUtils.IsInternal(tab.Url))
         {

@@ -62,7 +62,7 @@ internal sealed class TabStrip : Control
     /// <summary>鼠标捕获被系统收走时（例如弹出别的窗口）取消拖动，避免状态卡住。</summary>
     protected override void OnLostFocus(EventArgs e)
     {
-        EndDrag(commit: false);
+        EndDrag();
         base.OnLostFocus(e);
     }
 
@@ -74,13 +74,18 @@ internal sealed class TabStrip : Control
 
     /// <summary>「新建标签」按钮占的宽度。</summary>
     private int NewTabWidth => Theme.Sx(30);
+    private Rectangle TabViewport => new(0, 0, Math.Max(0, Width - NewTabWidth - Theme.Sx(6)), Height);
 
     /// <summary>把标签状态灌进来并重算命中区。</summary>
     public void Update(IReadOnlyList<BrowserTab> tabs, int activeIndex)
     {
+        BrowserTab previous = _activeIndex >= 0 && _activeIndex < _tabs.Count ? _tabs[_activeIndex] : null;
+        int previousCount = _tabs.Count;
         _tabs = tabs != null ? new List<BrowserTab>(tabs) : new List<BrowserTab>();
         _activeIndex = activeIndex;
         RebuildLayout();
+        if (previousCount != _tabs.Count || (_activeIndex >= 0 && _activeIndex < _tabs.Count && !ReferenceEquals(previous, _tabs[_activeIndex])))
+            EnsureVisible(_activeIndex);
         Invalidate();
     }
 
@@ -93,22 +98,25 @@ internal sealed class TabStrip : Control
     private void RebuildLayout()
     {
         _hits.Clear();
+        _newTabRect = Rectangle.Empty;
 
         int count = _tabs.Count;
         if (count == 0)
         {
             _contentWidth = 0;
+            _scrollOffset = 0;
+            LayoutNewTabButton();
             return;
         }
 
-        int available = Math.Max(0, Width - NewTabWidth - Theme.Sx(6));
+        int available = TabViewport.Width;
         int width = TabMaxWidthPx;
         if (count * width > available)
         {
             width = Math.Max(TabMinWidthPx, available / count);
         }
-        _contentWidth = count * width + NewTabWidth + Theme.Sx(6);
-        _scrollOffset = Math.Clamp(_scrollOffset, 0, Math.Max(0, _contentWidth - Width));
+        _contentWidth = count * width + Theme.Sx(3);
+        _scrollOffset = Math.Clamp(_scrollOffset, 0, Math.Max(0, _contentWidth - available));
 
         int x = -_scrollOffset + Theme.Sx(3);
         int y = Math.Max(0, (Height - TabHeightPx) / 2);
@@ -122,6 +130,14 @@ internal sealed class TabStrip : Control
             _hits.Add(new TabHit(bounds, close, i));
             x += width;
         }
+        LayoutNewTabButton();
+    }
+
+    private void LayoutNewTabButton()
+    {
+        int x = _hits.Count > 0 ? Math.Min(_hits[^1].Bounds.Right + Theme.Sx(6), TabViewport.Right) : Theme.Sx(4);
+        int size = Math.Min(Theme.Sy(26), Height);
+        _newTabRect = new Rectangle(x, Math.Max(0, (Height - size) / 2), Math.Min(size, Math.Max(0, Width - x)), size);
     }
 
     // ---------------------------------------------------------------- 绘制
@@ -142,6 +158,8 @@ internal sealed class TabStrip : Control
             g.FillRectangle(back, new Rectangle(0, 0, Width, Height));
         }
 
+        var clip = g.Save();
+        g.SetClip(TabViewport);
         foreach (TabHit hit in _hits)
         {
             if (hit.Bounds.Right < 0 || hit.Bounds.Left > Width)
@@ -154,8 +172,6 @@ internal sealed class TabStrip : Control
             }
         }
 
-        DrawNewTabButton(g);
-
         // 拖动排序时画一条指示线，告诉用户会插到哪里
         if (_dragging && _dragTargetIndex >= 0)
         {
@@ -164,10 +180,12 @@ internal sealed class TabStrip : Control
             g.DrawLine(pen, x, Theme.Sy(4), x, Height - Theme.Sy(4));
         }
 
-        if (_contentWidth > Width)
+        if (_contentWidth > TabViewport.Width)
         {
             DrawOverflowHints(g);
         }
+        g.Restore(clip);
+        DrawNewTabButton(g);
     }
 
     private void DrawTab(Graphics g, TabHit hit, BrowserTab tab, bool active)
@@ -202,7 +220,8 @@ internal sealed class TabStrip : Control
             _ => Theme.Dark ? Color.FromArgb(120, 126, 138) : Color.FromArgb(178, 183, 192),
         };
         int dotSize = Theme.Sx(7);
-        g.FillEllipse(new SolidBrush(dot), left - Theme.Sx(2),
+        using var dotBrush = new SolidBrush(dot);
+        g.FillEllipse(dotBrush, left - Theme.Sx(2),
             hit.Bounds.Top + hit.Bounds.Height / 2 - dotSize / 2, dotSize, dotSize);
 
         left += Theme.Sx(10);
@@ -229,17 +248,7 @@ internal sealed class TabStrip : Control
 
     private void DrawNewTabButton(Graphics g)
     {
-        int y = Math.Max(0, (Height - TabHeightPx) / 2);
-        int x = _hits.Count > 0
-            ? _hits[^1].Bounds.Right + Theme.Sx(6)
-            : Theme.Sx(4);
-        if (x > Width - NewTabWidth)
-        {
-            return;   // 放不下就不画（标签占满了）
-        }
-
-        var rect = new Rectangle(x, y + (TabHeightPx - Theme.Sy(26)) / 2,
-            Theme.Sy(26), Theme.Sy(26));
+        var rect = _newTabRect;
         if (_hoverNew)
         {
             Theme.FillRounded(g, rect, Theme.RadiusSmall, Theme.SurfaceHover);
@@ -248,7 +257,6 @@ internal sealed class TabStrip : Control
             _hoverNew ? Theme.Text : Theme.TextDim,
             TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter |
             TextFormatFlags.NoPadding);
-        _newTabRect = rect;
     }
 
     private Rectangle _newTabRect;
@@ -264,12 +272,12 @@ internal sealed class TabStrip : Control
                 LinearGradientMode.Horizontal);
             g.FillRectangle(brush, 0, 0, w, Height);
         }
-        if (_scrollOffset < _contentWidth - Width)
+        if (_scrollOffset < _contentWidth - TabViewport.Width)
         {
             using var brush = new LinearGradientBrush(
-                new Rectangle(Width - w, 0, w, Height), Color.Transparent, Theme.Background,
+                new Rectangle(TabViewport.Right - w, 0, w, Height), Color.Transparent, Theme.Background,
                 LinearGradientMode.Horizontal);
-            g.FillRectangle(brush, Width - w, 0, w, Height);
+            g.FillRectangle(brush, TabViewport.Right - w, 0, w, Height);
         }
     }
 
@@ -297,6 +305,7 @@ internal sealed class TabStrip : Control
         {
             return (-1, false);
         }
+        if (!TabViewport.Contains(p)) return (-2, false);
         foreach (TabHit hit in _hits)
         {
             if (hit.Close.Contains(p))
@@ -416,9 +425,10 @@ internal sealed class TabStrip : Control
         {
             int from = _dragIndex;
             int to = _dragTargetIndex;
-            EndDrag(commit: _dragging && to >= 0);
+            bool commit = _dragging && to >= 0;
+            EndDrag();
 
-            if (_dragging && to >= 0)
+            if (commit)
             {
                 // 插入位置是「第 to 个之前」，移动后目标下标要相应调整
                 int target = to > from ? to - 1 : to;
@@ -431,13 +441,19 @@ internal sealed class TabStrip : Control
         base.OnMouseUp(e);
     }
 
-    private void EndDrag(bool commit)
+    private void EndDrag()
     {
         _dragIndex = -1;
         _dragging = false;
         _dragTargetIndex = -1;
         Capture = false;
         Invalidate();
+    }
+
+    protected override void OnMouseCaptureChanged(EventArgs e)
+    {
+        if (!Capture && _dragIndex >= 0) EndDrag();
+        base.OnMouseCaptureChanged(e);
     }
 
     protected override void OnMouseLeave(EventArgs e)
@@ -451,7 +467,7 @@ internal sealed class TabStrip : Control
 
     protected override void OnMouseWheel(MouseEventArgs e)
     {
-        if (_contentWidth <= Width)
+        if (_contentWidth <= TabViewport.Width)
         {
             return;
         }
@@ -464,6 +480,7 @@ internal sealed class TabStrip : Control
     protected override void OnSizeChanged(EventArgs e)
     {
         RebuildLayout();
+        EnsureVisible(_activeIndex);
         base.OnSizeChanged(e);
     }
 
@@ -479,9 +496,9 @@ internal sealed class TabStrip : Control
         {
             _scrollOffset -= -b.Left + Theme.Sx(8);
         }
-        else if (b.Right > Width)
+        else if (b.Right > TabViewport.Right)
         {
-            _scrollOffset += b.Right - Width + Theme.Sx(8);
+            _scrollOffset += b.Right - TabViewport.Right + Theme.Sx(8);
         }
         RebuildLayout();
         Invalidate();

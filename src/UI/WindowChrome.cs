@@ -11,6 +11,13 @@ namespace FeatherBrowser.UI;
 /// </summary>
 internal static class WindowChrome
 {
+    internal static void FitDialog(Form dialog, Rectangle workingArea)
+    {
+        Rectangle area = Rectangle.Inflate(workingArea, -8, -8);
+        dialog.MinimumSize = new Size(Math.Min(dialog.MinimumSize.Width, area.Width), Math.Min(dialog.MinimumSize.Height, area.Height));
+        dialog.Size = new Size(Math.Min(dialog.Width, area.Width), Math.Min(dialog.Height, area.Height));
+        dialog.Location = new Point(Math.Clamp(dialog.Left, area.Left, area.Right - dialog.Width), Math.Clamp(dialog.Top, area.Top, area.Bottom - dialog.Height));
+    }
     private const int DwmwaUseImmersiveDarkMode = 20;
     private const int DwmwaUseImmersiveDarkModeLegacy = 19;
 

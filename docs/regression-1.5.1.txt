@@ -1,0 +1,40 @@
+PASS Interaction: dragging a tab commits its new position
+PASS Interaction: overflowing tabs keep the active tab and new button reachable before painting
+PASS Address recognition uses the host and preserves internal/file URLs
+PASS A second launch forwards its URL to the existing host through the user-only pipe
+PASS Passwords stay within the saved scheme, host and port
+PASS Interaction: memory statistics occupy separate visible rows
+PASS Interaction: native webpage keyboard focus routes browser shortcuts exactly once
+PASS Interaction: fullscreen hides all chrome and restores the previous window and sidebar
+PASS Interaction: address editing, tab switching, Escape and page zoom stay consistent
+PASS Interaction: website fullscreen follows native requests and browser commands expose the chrome
+PASS Interaction: history navigation to home clears the address and native find shows match counts
+PASS Interaction: settings and memory dialogs fit small screens with reachable fixed buttons
+PASS Theme font refresh preserves controls and existing font references
+PASS Homepage remains internal and does not enter history
+PASS Cold background tabs do not consume the resident budget
+PASS Rapid initialization, closing and recreation obey the resident limit
+PASS A pending suspend cannot hide the reactivated tab
+PASS Image loading switch blocks the actual network request
+PASS External content cannot call the internal management bridge
+PASS Disabling website JavaScript keeps the internal pages operational
+PASS The first login submission is captured without saved accounts
+PASS Forged account selections cannot retrieve a saved password
+PASS Browser-process failure reported by a background tab revives the active tab
+PASS Private browsing does not persist history or download records
+PASS The webpage stays below the chrome when resized and UI scale changes
+PASS Interaction: native Chromium window matches the viewport at every UI scale with sidebar and find open
+PASS Toggling the sidebar keeps the webpage visible and never changes dock order
+PASS Scrolled sidebar rows select and close the visible tab and exclude its header and footer
+PASS Menu mouse actions run on the browser after the menu closes
+PASS Tab context menus remain alive after showing and execute keyboard actions
+PASS Long menus fit small and negative-coordinate screens and their last item is reachable
+PASS Closing the first window keeps the second window and its session
+PASS Private windows clean their temporary profile without replacing the normal session
+PASS Closing a private window during initialization still cleans its profile
+PASS CEF subprocesses use the browser executable and memory excludes unrelated descendants
+PASS Private cookies are isolated from normal browsing and the next private window
+PASS CEF downloads save the actual file and complete the download record
+PASS CEF back and forward restore real navigation and native find works with website scripts disabled
+PASS window.open creates a browser tab without a separate native browser window
+Failures: 0

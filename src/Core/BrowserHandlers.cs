@@ -4,6 +4,53 @@ using FeatherBrowser.Services;
 
 namespace FeatherBrowser.Core;
 
+internal sealed class BrowserKeyboardHandler(BrowserView view, TabManager manager, BrowserTab tab) : KeyboardHandler
+{
+    protected override bool OnPreKeyEvent(IWebBrowser chromiumWebBrowser, IBrowser browser, KeyType type,
+        int windowsKeyCode, int nativeKeyCode, CefEventFlags modifiers, bool isSystemKey, ref bool isKeyboardShortcut)
+    {
+        Keys keys = (Keys)windowsKeyCode;
+        if (modifiers.HasFlag(CefEventFlags.ControlDown)) keys |= Keys.Control;
+        if (modifiers.HasFlag(CefEventFlags.ShiftDown)) keys |= Keys.Shift;
+        if (modifiers.HasFlag(CefEventFlags.AltDown)) keys |= Keys.Alt;
+        if (!BrowserShortcuts.Contains(keys)) return false;
+        // Escape 先交给网页处理（例如关闭网页自己的弹层）。
+        if (keys == Keys.Escape) { isKeyboardShortcut = true; return false; }
+        if (type is not (KeyType.RawKeyDown or KeyType.KeyDown)) return false;
+        view.Ui(() => { if (tab.OwnsView(view)) manager.NotifyShortcut(tab, keys); });
+        return true;
+    }
+
+    protected override bool OnKeyEvent(IWebBrowser chromiumWebBrowser, IBrowser browser, KeyType type,
+        int windowsKeyCode, int nativeKeyCode, CefEventFlags modifiers, bool isSystemKey)
+    {
+        if (windowsKeyCode != (int)Keys.Escape || type is not (KeyType.RawKeyDown or KeyType.KeyDown)) return false;
+        view.Ui(() => { if (tab.OwnsView(view)) manager.NotifyShortcut(tab, Keys.Escape); });
+        return true;
+    }
+}
+
+internal sealed class BrowserDisplayHandler(BrowserView view, TabManager manager, BrowserTab tab) : DisplayHandler
+{
+    protected override void OnFullscreenModeChange(IWebBrowser chromiumWebBrowser, IBrowser browser, bool fullscreen)
+        => view.Ui(() => { if (tab.OwnsView(view)) manager.NotifyFullscreen(tab, fullscreen); });
+}
+
+internal sealed class BrowserFocusHandler : FocusHandler
+{
+    protected override bool OnSetFocus(IWebBrowser chromiumWebBrowser, IBrowser browser, CefFocusSource source)
+        => source == CefFocusSource.FocusSourceNavigation;
+}
+
+internal sealed class BrowserFindHandler(BrowserView view, TabManager manager, BrowserTab tab) : FindHandler
+{
+    protected override void OnFindResult(IWebBrowser chromiumWebBrowser, IBrowser browser, int identifier,
+        int count, CefSharp.Structs.Rect selectionRect, int activeMatchOrdinal, bool finalUpdate)
+    {
+        if (finalUpdate) view.Ui(() => { if (tab.OwnsView(view)) manager.NotifyFindResult(tab, activeMatchOrdinal, count); });
+    }
+}
+
 internal sealed class BrowserRequestHandler(BrowserView view, TabManager manager, BrowserTab tab) : RequestHandler
 {
     protected override bool OnBeforeBrowse(IWebBrowser chromiumWebBrowser, IBrowser browser, IFrame frame,

@@ -6,7 +6,7 @@
 
 ## 下载与升级
 
-到 [GitHub Releases](https://github.com/iownmmiku/feather-browser/releases/latest) 下载 `FeatherBrowser-1.5.0-setup.exe`。
+到 [GitHub Releases](https://github.com/iownmmiku/feather-browser/releases/latest) 下载 `FeatherBrowser-1.5.1-setup.exe`。
 
 安装包包括 .NET、Chromium 内核和经微软签名验证的 VC++ x64 运行库，无需另装 WebView2。VC++ 依赖缺失时离线安装。升级前关闭浏览器，再运行安装程序。安装目录默认为 `%ProgramFiles%\Feather Browser`。
 
@@ -14,16 +14,17 @@
 
 卸载默认保留个人数据，只删除安装负载文件与空目录；用户可选择同时删除 `%LOCALAPPDATA%\FeatherBrowser` 中的个人数据。
 
-## 本轮修复
+## 1.5.1 修复
 
-- 修正 WinForms Dock 顺序，网页区域完整位于工具栏、标签栏、查找条和状态栏之间，缩放与调整窗口时保持正确布局。
-- 标签侧边栏与网页并排显示，滚动后命中区域立即更新，支持键盘选择、关闭标签和打开内存面板。
-- 菜单动作在主窗口上执行，修复关闭菜单后点击无响应；长菜单适应屏幕高度，可滚动访问底部选项。
-- 替换内核并重新接入导航、下载、内部管理页、拦截、密码助手、深色主题和网页缩放。
-- 冷标签的快速切换先合并创建请求；视图初始化和销毁期间保留原生窗口及关闭处理器，避免崩溃或误关主窗口。
-- 同一数据目录再次启动时，通过当前用户专用管道在已有进程打开新窗口，共用 Cookie 与数据。
+- 修复设置窗口初始化异常、内存面板统计文字重叠。长内容可滚动，保存、取消和关闭按钮保持可见；小屏幕和高倍率下限制对话框尺寸。
+- 修复标签拖动排序；标签过多时自动显示当前标签，新建按钮始终可用，绘制与点击区域同步更新。
+- 网页获得焦点后，Ctrl+T、Ctrl+L、Ctrl+Tab 等浏览器快捷键仍能工作；保留网页自身的复制、粘贴和全选。
+- 新标签直接输入地址；切换标签更新地址栏，Esc 撤销地址编辑，回车导航与关闭查找后恢复网页焦点。
+- Ctrl++、Ctrl+-、Ctrl+0 统一调整当前网页的缩放；整体界面倍率在菜单或设置中调整，并同步所有窗口。
+- 全屏隐藏完整的浏览器界面，退出后恢复窗口与侧栏状态；支持网页发起的全屏请求，浏览器命令可重新显示界面。
+- 修复前进后退回首页时的地址显示；查找显示实际匹配数量，加载按钮支持停止导航。
 
-验证与技术说明见 [1.5.0 修复记录](docs/fixes-1.5.0.md) 和 [回归报告](docs/regression-1.5.0.txt)。旧版截图仅供界面风格参考：[浅色](docs/screenshot-light.png)、[深色](docs/screenshot-dark.png)。
+验证与技术说明见 [1.5.1 修复记录](docs/fixes-1.5.1.md) 和 [回归报告](docs/regression-1.5.1.txt)。内核迁移的详细记录保留在 [1.5.0 修复记录](docs/fixes-1.5.0.md)。
 
 ## 功能
 
@@ -90,7 +91,8 @@ FeatherBrowser.exe --import-quark=passwords
 | Ctrl+L | 地址栏 | Ctrl+D | 收藏页面 |
 | Ctrl+F | 页内查找 | F5 / Ctrl+R | 刷新 |
 | Alt+← / Alt+→ | 后退 / 前进 | Ctrl++ / Ctrl+- | 网页缩放 |
-| Ctrl+= / Ctrl+0 | 界面放大 / 复位 | F11 | 全屏 |
+| Ctrl+0 | 网页缩放复位 | F11 | 全屏 |
+| Ctrl+1…8 / Ctrl+9 | 指定标签 / 最后一个标签 | Alt+F | 菜单 |
 | Esc | 关闭菜单、侧边栏、查找或停止加载 | | |
 
 ## 构建与验证
@@ -103,7 +105,7 @@ dotnet run --project .\tests\FeatherBrowser.Tests.csproj -c Release
 .\tools\build-installer.ps1 -MakensisPath C:\Tools\nsis\makensis.exe
 ```
 
-构建脚本默认读取项目版本号，以 `win-x64 --self-contained true` 发布完整依赖，验证 VC++ 安装程序签名后生成 `dist\FeatherBrowser-1.5.0-setup.exe`。`-SkipInstaller` 只生成发布目录。使用 SelfHost 承载 CEF 子进程，发布目录不包含默认的 `CefSharp.BrowserSubprocess.exe`。
+构建脚本默认读取项目版本号，以 `win-x64 --self-contained true` 发布完整依赖，验证 VC++ 安装程序签名后生成 `dist\FeatherBrowser-1.5.1-setup.exe`。`-SkipInstaller` 只生成发布目录。使用 SelfHost 承载 CEF 子进程，发布目录不包含默认的 `CefSharp.BrowserSubprocess.exe`。
 
 回归测试使用隔离的临时数据目录和本机 HTTP 服务器，覆盖真实 Chromium 导航、Cookie、脚本策略、消息来源校验、密码助手、下载、标签生命周期、布局与菜单。测试不会使用真实用户配置或保存密码。
 

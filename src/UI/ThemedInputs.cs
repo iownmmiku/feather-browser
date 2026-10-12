@@ -25,8 +25,8 @@ internal sealed class ThemedTextBox : Panel
             ForeColor = Theme.Text,
             Font = Theme.UiFont,
         };
-        // 垂直居中：用 Dock 撑满再把高度收窄
-        Inner.Dock = DockStyle.Fill;
+        // 由 OnLayout 设置实际位置，避免 Dock 在之后的布局中覆盖垂直居中。
+        Inner.Dock = DockStyle.None;
         Inner.AutoSize = false;
         Controls.Add(Inner);
     }
@@ -47,6 +47,7 @@ internal sealed class ThemedTextBox : Panel
     protected override void OnLayout(LayoutEventArgs levent)
     {
         base.OnLayout(levent);
+        if (Inner == null) return;
         // 让内层文本框在自己高度里垂直居中
         int height = Inner.Font.Height + Theme.Sy(6);
         int top = Math.Max(0, (ClientSize.Height - height) / 2);

@@ -43,6 +43,10 @@ public sealed class BrowserView : ChromiumWebBrowser, CefSharp.Internals.IWebBro
         LifeSpanHandler = _lifeSpan;
         MenuHandler = new BrowserContextMenuHandler(this, manager, tab);
         DownloadHandler = new BrowserDownloadHandler(this, manager);
+        KeyboardHandler = new BrowserKeyboardHandler(this, manager, tab);
+        DisplayHandler = new BrowserDisplayHandler(this, manager, tab);
+        FocusHandler = new BrowserFocusHandler();
+        FindHandler = new BrowserFindHandler(this, manager, tab);
         IsBrowserInitializedChanged += (_, _) =>
         {
             if (IsBrowserInitialized) _initialized.TrySetResult();
